@@ -1,0 +1,109 @@
+# USB Android Monitor
+
+Local monitor for Android phones connected by USB, focused on Win11 and Ubuntu environments
+where phones are usually connected through a USB hub.
+
+The monitor uses `adb devices -l` as the source of truth for Android phone state, then adds
+USB/hub context from the operating system where available.
+
+## Supported Targets
+
+- Ubuntu: `adb` plus optional `lsusb` for USB/hub context.
+- Win11: `adb` plus PowerShell PnP enumeration for USB context.
+- macOS: still supported for development through `system_profiler`.
+
+## Requirements
+
+Install Android platform-tools and make sure `adb` is on `PATH`.
+
+Ubuntu:
+
+```sh
+sudo apt install android-tools-adb usbutils
+```
+
+Win11:
+
+1. Install Android SDK Platform-Tools.
+2. Add the platform-tools folder to `PATH`.
+3. Enable USB debugging on the phone.
+4. Authorize the computer on the phone when prompted.
+
+## Recovery Model
+
+Remote phone labs usually fail in two different ways:
+
+- ADB state failure: the phone still exists on USB, but `adb devices` shows `offline`,
+  `unknown`, or no usable transport. The app can usually recover this with ADB reconnects.
+- USB bus disappearance: the phone disappears from the operating system. At this point ADB
+  cannot address the phone anymore, so the app needs a configured Hub port and a tool that can
+  power-cycle or restart that port.
+
+For Ubuntu, use a Hub supported by `uhubctl` if you need software-controlled unplug/replug.
+For Win11, the app can attempt a `pnputil /restart-device` for a configured USB instance id,
+but true per-port power cycling depends on the Hub hardware and driver.
+
+Copy the example config and fill in your real device serials:
+
+```sh
+cp usb_android_monitor_config.example.json usb_android_monitor_config.json
+```
+
+Example:
+
+```json
+{
+  "auto_recovery": {
+    "enabled": true,
+    "cooldown_seconds": 60,
+    "power_cycle_missing": false
+  },
+  "devices": {
+    "R58N123456": {
+      "name": "Pixel 6 rack slot 1",
+      "uhubctl": {
+        "enabled": true,
+        "location": "1-1",
+        "port": "2"
+      },
+      "windows_instance_id": "USB\\VID_18D1&PID_4EE7\\R58N123456"
+    }
+  }
+}
+```
+
+Set `power_cycle_missing` to `true` only after verifying that the configured Hub port is correct,
+because power cycling the wrong port can disconnect another phone.
+
+## Quick Start
+
+```sh
+python3 usb_android_monitor.py list
+python3 usb_android_monitor.py watch
+python3 usb_android_monitor.py serve
+```
+
+Open the dashboard at <http://127.0.0.1:8765> after running `serve`.
+
+## Commands
+
+- `list`: print the current USB and ADB state once.
+- `watch`: keep polling and print Android connect/disconnect/change events.
+- `serve`: start a local HTTP dashboard and JSON API with reconnect controls.
+- `reconnect --serial SERIAL`: restart the ADB transport for one phone.
+- `reconnect`: restart ADB discovery for all phones.
+- `recover SERIAL`: run the full recovery ladder for a configured phone.
+- `disconnect SERIAL`: try to disable USB data functions on the phone through ADB.
+
+## Notes
+
+- If the USB cable or hub is physically disconnected, software cannot force the device back.
+  It can only restart ADB discovery, reset the operating system's USB device, or power-cycle a
+  supported Hub port.
+- The dashboard's automatic reconnect attempts recover common ADB states such as `offline`.
+- Manual disconnect is a best-effort Android-side USB data disable using
+  `adb shell svc usb setFunctions none`. Some phones or Android versions may reject it.
+- On Ubuntu, `adb devices -l` often includes a USB path such as `1-1.2`; the dot usually means
+  the phone is behind a downstream hub.
+- On Win11, exact hub ancestry depends on the USB driver stack. The app reports PnP USB context,
+  and ADB remains the authority for Android connection state.

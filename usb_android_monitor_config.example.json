@@ -1,0 +1,18 @@
+{
+  "auto_recovery": {
+    "enabled": true,
+    "cooldown_seconds": 60,
+    "power_cycle_missing": false
+  },
+  "devices": {
+    "R58N123456": {
+      "name": "Pixel 6 rack slot 1",
+      "uhubctl": {
+        "enabled": true,
+        "location": "1-1",
+        "port": "2"
+      },
+      "windows_instance_id": "USB\\VID_18D1&PID_4EE7\\R58N123456"
+    }
+  }
+}

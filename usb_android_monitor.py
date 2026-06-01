@@ -846,8 +846,16 @@ def acroname_mapping_control(config: dict[str, Any]) -> dict[str, Any]:
     control = dict(acroname)
     control.setdefault("type", "acroname")
     control.setdefault("model", "USBHub3c")
-    control.setdefault("ports", [1, 2, 3, 4, 5])
+    control.setdefault("ports", [0, 1, 2, 3, 4, 5])
     return control
+
+
+def brainstem_available() -> bool:
+    try:
+        import brainstem  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def acroname_control_for_port(mapping_control: dict[str, Any], port: int) -> dict[str, Any]:
@@ -1005,7 +1013,12 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
         missing = wait_for_serials_absent(before)
         on = run_acroname_port_action("", control, "on")
         returned = wait_for_serials_present(missing) if missing else set()
-        if missing:
+        if len(missing) > 1:
+            messages.append(
+                f"port {port}: ambiguous, multiple ADB serials disappeared "
+                f"({', '.join(sorted(missing))}); not saving a mapping"
+            )
+        elif missing:
             for serial in sorted(missing):
                 learned = dict(control)
                 learned["source"] = "auto-map"
@@ -1226,6 +1239,14 @@ def disconnect_device(serial: str) -> dict[str, Any]:
             f"{'absent' if verified else 'still ' + last_state}; {result['message']}",
             serial,
         )
+    if platform.system().lower() == "windows" and brainstem_available():
+        return record_action(
+            "disconnect",
+            False,
+            "No learned Acroname port mapping for this serial. Run Auto-map Acroname ports first; "
+            "the Android-side USB disable fallback is not a reliable computer-side disconnect.",
+            serial,
+        )
     if platform.system().lower() == "linux":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:
@@ -1406,6 +1427,7 @@ def snapshot() -> dict[str, Any]:
         "platform": platform.system(),
         "usb_backend": usb_backend,
         "adb_available": bool(shutil.which("adb")),
+        "acroname_available": brainstem_available(),
         "auto_reconnect_enabled": AUTO_RECONNECT_ENABLED,
         "config_path": CONFIG_PATH,
         "configured_device_count": len(configured_devices(config)),
@@ -1611,6 +1633,8 @@ INDEX_HTML = """<!doctype html>
         ? `<div class="hint">Hub control target: Acroname ${device.acroname_control.model || "USBHub3c"} port ${device.acroname_control.port} (${device.acroname_control.source || "state"})</div>`
         : device.uhubctl_target && device.uhubctl_target.location
         ? `<div class="hint">Hub control target: uhubctl -l ${device.uhubctl_target.location} -p ${device.uhubctl_target.port} (${device.uhubctl_target.source})</div>`
+        : state.acroname_available
+        ? `<div class="hint">No Acroname port mapping learned yet. Run Auto-map Acroname ports before using Disconnect.</div>`
         : `<div class="hint">No controllable Hub port inferred yet. Disconnect will fall back to Android-side USB data disable.</div>`;
       const disabled = active ? "disabled" : "";
       return `<article class="device ${cls}">

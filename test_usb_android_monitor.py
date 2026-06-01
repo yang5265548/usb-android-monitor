@@ -4,7 +4,9 @@ from unittest.mock import patch
 import usb_android_monitor
 from usb_android_monitor import (
     acroname_control_for_serial,
+    acroname_mapping_control,
     configured_devices,
+    disconnect_device,
     flatten_usb_tree,
     hub_evidence_from_adb_usb_path,
     infer_uhubctl_target_from_usb_path,
@@ -164,6 +166,22 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(control["type"], "acroname")
         self.assertEqual(control["port"], 4)
         self.assertEqual(control["source"], "state")
+
+    def test_acroname_mapping_defaults_include_port_zero(self) -> None:
+        self.assertEqual(acroname_mapping_control({})["ports"], [0, 1, 2, 3, 4, 5])
+
+    def test_windows_acroname_without_mapping_does_not_use_android_fallback(self) -> None:
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.known_devices_snapshot", return_value={}),
+            patch("usb_android_monitor.platform.system", return_value="Windows"),
+            patch("usb_android_monitor.brainstem_available", return_value=True),
+        ):
+            result = disconnect_device("SERIAL1")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Auto-map Acroname ports", result["message"])
+        self.assertNotIn("setFunctions", result["message"])
 
     def test_configured_devices_rejects_non_dict(self) -> None:
         self.assertEqual(configured_devices({"devices": []}), {})

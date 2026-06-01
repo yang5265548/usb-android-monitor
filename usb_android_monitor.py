@@ -62,6 +62,7 @@ ACTION_LOCK = threading.Lock()
 AUTO_RECONNECT_ENABLED = True
 AUTO_RECONNECT_ATTEMPTS: dict[str, float] = {}
 MANUAL_DISCONNECT_UNTIL: dict[str, float] = {}
+DISCONNECTED_TARGETS: dict[str, dict[str, str]] = {}
 CONFIG_PATH = os.environ.get("USB_ANDROID_MONITOR_CONFIG", "usb_android_monitor_config.json")
 
 
@@ -114,6 +115,7 @@ def record_action(action: str, ok: bool, message: str, serial: str = "", status:
 
 def run_action_async(action: str, serial: str) -> dict[str, Any]:
     action_map = {
+        "connect": connect_device,
         "reconnect": reconnect_device,
         "recover": recover_device,
         "verify": verify_device,
@@ -393,10 +395,30 @@ def uhubctl_target_for_serial(serial: str, config: dict[str, Any]) -> dict[str, 
             "port": str(configured["port"]),
             "source": "config",
         }
+    with ACTION_LOCK:
+        remembered = DISCONNECTED_TARGETS.get(serial)
+    if remembered:
+        return dict(remembered)
     adb_device = get_adb_device(serial)
     if not adb_device:
         return {}
     return infer_uhubctl_target_from_usb_path(adb_device.usb_path)
+
+
+def remember_disconnected_target(serial: str, target: dict[str, Any]) -> None:
+    if not serial or not target.get("location") or not target.get("port"):
+        return
+    with ACTION_LOCK:
+        DISCONNECTED_TARGETS[serial] = {
+            "location": str(target["location"]),
+            "port": str(target["port"]),
+            "source": str(target.get("source") or "remembered"),
+        }
+
+
+def forget_disconnected_target(serial: str) -> None:
+    with ACTION_LOCK:
+        DISCONNECTED_TARGETS.pop(serial, None)
 
 
 def explain_uhubctl_failure(output: str, target: dict[str, Any]) -> str:
@@ -674,6 +696,28 @@ def power_off_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict
     return record_action("hub-port-off", result.returncode == 0, message, serial)
 
 
+def power_on_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
+    uhubctl = device_config.get("uhubctl", device_config)
+    if not uhubctl.get("location") or not uhubctl.get("port"):
+        return record_action("hub-port-on", False, "missing uhubctl location or port", serial)
+    if not shutil.which("uhubctl"):
+        return record_action("hub-port-on", False, "uhubctl is not installed or not on PATH", serial)
+    command = [
+        "uhubctl",
+        "-l",
+        str(uhubctl["location"]),
+        "-p",
+        str(uhubctl["port"]),
+        "-a",
+        "on",
+    ]
+    result = run_command(command, timeout=20)
+    output = (result.stdout + result.stderr).strip()
+    diagnostic = explain_uhubctl_failure(output, uhubctl)
+    message = f"{diagnostic}{output or result.returncode}"
+    return record_action("hub-port-on", result.returncode == 0, message, serial)
+
+
 def restart_windows_usb_device(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
     instance_id = device_config.get("windows_instance_id", "")
     if not instance_id:
@@ -711,6 +755,45 @@ def recover_device(serial: str = "", reason: str = "manual", allow_power_cycle: 
     return record_action("recover", ok, " | ".join(messages), serial)
 
 
+def connect_device(serial: str) -> dict[str, Any]:
+    if not serial:
+        return record_action("connect", False, "serial is required")
+    config = load_config()
+    messages: list[str] = []
+    ok = False
+    if platform.system().lower() == "linux":
+        uhubctl_target = uhubctl_target_for_serial(serial, config)
+        if uhubctl_target:
+            result = power_on_linux_hub_port(serial, uhubctl_target)
+            messages.append(
+                f"hub port power on via {uhubctl_target.get('source', '-')}: {result['message']}"
+            )
+            ok = result["ok"]
+            if ok:
+                MANUAL_DISCONNECT_UNTIL.pop(serial, None)
+                time.sleep(3)
+                messages.append(reconnect_device(serial)["message"])
+                state = adb_state_for_serial(serial)
+                if state != "absent":
+                    forget_disconnected_target(serial)
+                    return record_action("connect", True, f"{' | '.join(messages)} | adb state={state}", serial)
+                return record_action(
+                    "connect",
+                    False,
+                    f"{' | '.join(messages)} | hub port is on, but serial is still absent from adb",
+                    serial,
+                )
+        else:
+            messages.append("no remembered or configured uhubctl target; only restarting ADB")
+    MANUAL_DISCONNECT_UNTIL.pop(serial, None)
+    messages.append(reconnect_device(serial)["message"])
+    state = adb_state_for_serial(serial)
+    ok = state != "absent"
+    if ok:
+        forget_disconnected_target(serial)
+    return record_action("connect", ok, f"{' | '.join(messages)} | adb state={state}", serial)
+
+
 def disconnect_device(serial: str) -> dict[str, Any]:
     if not serial:
         return record_action("disconnect", False, "serial is required")
@@ -720,6 +803,7 @@ def disconnect_device(serial: str) -> dict[str, Any]:
     if platform.system().lower() == "linux":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:
+            remember_disconnected_target(serial, uhubctl_target)
             result = power_off_linux_hub_port(serial, uhubctl_target)
             verified, last_state = wait_for_adb_absent(serial)
             return record_action(
@@ -812,16 +896,41 @@ def snapshot() -> dict[str, Any]:
     auto_reconnect_if_needed(android_devices, config)
     usb_android = [device for device in usb_devices if device.is_android_candidate]
     current_serials = {device["serial"] for device in android_devices}
+    for serial in current_serials:
+        forget_disconnected_target(serial)
     missing_configured = [
         {
             "serial": serial,
             "name": str(device_config.get("name") or serial),
             "recovery_plan": recovery_plan_for_serial(serial, config),
             "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
+            "power_target": uhubctl_target_for_serial(serial, config),
+            "reason": "configured",
         }
         for serial, device_config in configured_devices(config).items()
         if serial not in current_serials
     ]
+    with ACTION_LOCK:
+        remembered_targets = {
+            serial: dict(target)
+            for serial, target in DISCONNECTED_TARGETS.items()
+            if serial not in current_serials
+        }
+    for serial, target in remembered_targets.items():
+        if not any(device["serial"] == serial for device in missing_configured):
+            missing_configured.append(
+                {
+                    "serial": serial,
+                    "name": serial,
+                    "recovery_plan": [
+                        f"uhubctl on location={target['location']} port={target['port']}",
+                        "adb reconnect",
+                    ],
+                    "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
+                    "power_target": target,
+                    "reason": "powered-off",
+                }
+            )
     behind_hub_count = sum(1 for device in android_devices if device["behind_hub"]) + sum(
         1 for device in usb_android if device.parent_hubs
     )
@@ -1053,10 +1162,15 @@ INDEX_HTML = """<!doctype html>
     function missingCard(device, state) {
       const active = isSerialActive(state, device.serial);
       const disabled = active ? "disabled" : "";
+      const target = device.power_target && device.power_target.location
+        ? `<div class="hint">Power target: uhubctl -l ${device.power_target.location} -p ${device.power_target.port} (${device.power_target.source})</div>`
+        : `<div class="hint">No Hub power target is known for this missing device.</div>`;
       return `<article class="device warn">
-        <div class="name">${device.name}<span class="tag">${device.serial}</span></div>
+        <div class="name">${device.name}<span class="tag">${device.serial}</span><span class="tag">${device.reason || "missing"}</span></div>
         <div class="meta">Recovery plan: ${device.recovery_plan.join(" -> ")}</div>
+        ${target}
         <div class="actions">
+          <button class="primary" data-action="connect" data-serial="${device.serial}" ${disabled} onclick="doAction('connect', '${device.serial}')">Power on / Connect</button>
           <button data-action="verify" data-serial="${device.serial}" ${disabled} onclick="doAction('verify', '${device.serial}')">Verify</button>
           <button class="primary" data-action="recover" data-serial="${device.serial}" ${disabled} onclick="doAction('recover', '${device.serial}')">Recover</button>
         </div>
@@ -1216,6 +1330,9 @@ def main() -> int:
     reconnect_parser = subparsers.add_parser("reconnect", help="restart ADB discovery or reconnect one device")
     reconnect_parser.add_argument("--serial", default="")
 
+    connect_parser = subparsers.add_parser("connect", help="power on a remembered/configured hub port and reconnect")
+    connect_parser.add_argument("serial")
+
     recover_parser = subparsers.add_parser("recover", help="run the recovery ladder for one configured device")
     recover_parser.add_argument("serial")
 
@@ -1234,6 +1351,8 @@ def main() -> int:
         serve(args.host, args.port)
     elif args.command == "reconnect":
         print(json.dumps(reconnect_device(args.serial), ensure_ascii=False, indent=2))
+    elif args.command == "connect":
+        print(json.dumps(connect_device(args.serial), ensure_ascii=False, indent=2))
     elif args.command == "recover":
         print(json.dumps(recover_device(args.serial), ensure_ascii=False, indent=2))
     elif args.command == "verify":

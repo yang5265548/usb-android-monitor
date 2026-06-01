@@ -54,6 +54,10 @@ If it reports `No controllable hub was found`, run `sudo uhubctl` and check whet
 such as `1-2` or `2-2` are listed. If they are not listed, the current Hub is visible in USB
 topology but cannot be power-cycled by `uhubctl`.
 
+After a successful `Disconnect and verify`, the device moves to the missing list with a
+`Power on / Connect` button. `Restart ADB discovery` only restarts ADB; it does not power a Hub
+port back on.
+
 Copy the example config and fill in your real device serials:
 
 ```sh
@@ -103,6 +107,7 @@ Open the dashboard at <http://127.0.0.1:8765> after running `serve`.
 - `serve`: start a local HTTP dashboard and JSON API with reconnect controls.
 - `reconnect --serial SERIAL`: restart the ADB transport for one phone.
 - `reconnect`: restart ADB discovery for all phones.
+- `connect SERIAL`: power on a remembered/configured Hub port, then restart ADB discovery.
 - `recover SERIAL`: run the full recovery ladder for a configured phone.
 - `verify SERIAL`: verify whether the serial is absent from `adb devices`.
 - `disconnect SERIAL`: disconnect and verify. If the device has a configured `uhubctl` Hub port

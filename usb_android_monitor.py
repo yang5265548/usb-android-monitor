@@ -292,6 +292,22 @@ def wait_for_adb_absent(serial: str, timeout_seconds: float = 6.0) -> tuple[bool
     return False, last_state
 
 
+def verify_device(serial: str) -> dict[str, Any]:
+    if not serial:
+        return record_action("verify", False, "serial is required")
+    if not shutil.which("adb"):
+        return record_action("verify", False, "adb is not installed or not on PATH", serial)
+    state = adb_state_for_serial(serial)
+    if state == "absent":
+        return record_action("verify", True, "verified disconnected from ADB: serial is absent", serial)
+    return record_action(
+        "verify",
+        False,
+        f"still connected according to ADB: serial is present with state={state}",
+        serial,
+    )
+
+
 def get_macos_usb_devices() -> list[UsbDevice]:
     if not shutil.which("system_profiler"):
         return []
@@ -820,6 +836,7 @@ INDEX_HTML = """<!doctype html>
         <div class="actions">
           <button onclick="doAction('reconnect', '${device.serial}')">Reconnect</button>
           <button onclick="doAction('recover', '${device.serial}')">Recover</button>
+          <button onclick="doAction('verify', '${device.serial}')">Verify</button>
           <button class="danger" onclick="doAction('disconnect', '${device.serial}')">Disconnect and verify</button>
         </div>
       </article>`;
@@ -830,6 +847,7 @@ INDEX_HTML = """<!doctype html>
         <div class="name">${device.name}<span class="tag">${device.serial}</span></div>
         <div class="meta">Recovery plan: ${device.recovery_plan.join(" -> ")}</div>
         <div class="actions">
+          <button onclick="doAction('verify', '${device.serial}')">Verify</button>
           <button onclick="doAction('recover', '${device.serial}')">Recover</button>
         </div>
       </article>`;
@@ -929,6 +947,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
             result = reconnect_device(serial)
         elif action == "recover":
             result = recover_device(serial)
+        elif action == "verify":
+            result = verify_device(serial)
         elif action == "disconnect":
             result = disconnect_device(serial)
         else:
@@ -974,6 +994,9 @@ def main() -> int:
     recover_parser = subparsers.add_parser("recover", help="run the recovery ladder for one configured device")
     recover_parser.add_argument("serial")
 
+    verify_parser = subparsers.add_parser("verify", help="verify whether one serial is absent from ADB")
+    verify_parser.add_argument("serial")
+
     disconnect_parser = subparsers.add_parser("disconnect", help="try to disable USB data on one Android device")
     disconnect_parser.add_argument("serial")
 
@@ -988,6 +1011,8 @@ def main() -> int:
         print(json.dumps(reconnect_device(args.serial), ensure_ascii=False, indent=2))
     elif args.command == "recover":
         print(json.dumps(recover_device(args.serial), ensure_ascii=False, indent=2))
+    elif args.command == "verify":
+        print(json.dumps(verify_device(args.serial), ensure_ascii=False, indent=2))
     elif args.command == "disconnect":
         print(json.dumps(disconnect_device(args.serial), ensure_ascii=False, indent=2))
     return 0

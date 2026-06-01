@@ -93,6 +93,7 @@ Open the dashboard at <http://127.0.0.1:8765> after running `serve`.
 - `reconnect --serial SERIAL`: restart the ADB transport for one phone.
 - `reconnect`: restart ADB discovery for all phones.
 - `recover SERIAL`: run the full recovery ladder for a configured phone.
+- `verify SERIAL`: verify whether the serial is absent from `adb devices`.
 - `disconnect SERIAL`: disconnect and verify. If the device has a configured `uhubctl` Hub port
   on Linux, this powers off that port and verifies the serial disappears from ADB. Otherwise it
   falls back to `adb shell svc usb setFunctions none` and reports failure if ADB still sees the
@@ -108,6 +109,9 @@ Open the dashboard at <http://127.0.0.1:8765> after running `serve`.
   device is still visible, the command did not create a real disconnect even if Android accepted
   it. For reliable computer-side disconnect/reconnect in a remote lab, configure `uhubctl` and
   use a Hub that supports per-port power switching.
+- The phone UI may not show anything when USB data is disabled. Treat the computer-side evidence
+  as authoritative: `adb devices -l` should no longer list that serial, and the dashboard should
+  show one fewer ADB Android device.
 - On Ubuntu, `adb devices -l` often includes a USB path such as `1-1.2`; the dot usually means
   the phone is behind a downstream hub.
 - On Win11, exact hub ancestry depends on the USB driver stack. The app reports PnP USB context,

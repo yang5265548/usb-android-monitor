@@ -59,6 +59,7 @@ HUB_TEXT_MARKERS = ("hub", "multiport", "dock", "adapter")
 LAST_ACTIONS: list[dict[str, Any]] = []
 AUTO_RECONNECT_ENABLED = True
 AUTO_RECONNECT_ATTEMPTS: dict[str, float] = {}
+MANUAL_DISCONNECT_UNTIL: dict[str, float] = {}
 CONFIG_PATH = os.environ.get("USB_ANDROID_MONITOR_CONFIG", "usb_android_monitor_config.json")
 
 
@@ -273,6 +274,24 @@ def get_adb_devices() -> list[AdbDevice]:
     return parse_adb_devices(result.stdout)
 
 
+def adb_state_for_serial(serial: str) -> str:
+    for device in get_adb_devices():
+        if device.serial == serial:
+            return device.state
+    return "absent"
+
+
+def wait_for_adb_absent(serial: str, timeout_seconds: float = 6.0) -> tuple[bool, str]:
+    deadline = time.time() + timeout_seconds
+    last_state = adb_state_for_serial(serial)
+    while time.time() < deadline:
+        last_state = adb_state_for_serial(serial)
+        if last_state == "absent":
+            return True, last_state
+        time.sleep(0.5)
+    return False, last_state
+
+
 def get_macos_usb_devices() -> list[UsbDevice]:
     if not shutil.which("system_profiler"):
         return []
@@ -465,6 +484,26 @@ def power_cycle_linux_hub_port(serial: str, device_config: dict[str, Any]) -> di
     return record_action("power-cycle", result.returncode == 0, output or str(result.returncode), serial)
 
 
+def power_off_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
+    uhubctl = device_config.get("uhubctl", {})
+    if not uhubctl.get("location") or not uhubctl.get("port"):
+        return record_action("hub-port-off", False, "missing uhubctl location or port in config", serial)
+    if not shutil.which("uhubctl"):
+        return record_action("hub-port-off", False, "uhubctl is not installed or not on PATH", serial)
+    command = [
+        "uhubctl",
+        "-l",
+        str(uhubctl["location"]),
+        "-p",
+        str(uhubctl["port"]),
+        "-a",
+        "off",
+    ]
+    result = run_command(command, timeout=20)
+    output = (result.stdout + result.stderr).strip()
+    return record_action("hub-port-off", result.returncode == 0, output or str(result.returncode), serial)
+
+
 def restart_windows_usb_device(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
     instance_id = device_config.get("windows_instance_id", "")
     if not instance_id:
@@ -502,13 +541,42 @@ def recover_device(serial: str = "", reason: str = "manual", allow_power_cycle: 
 def disconnect_device(serial: str) -> dict[str, Any]:
     if not serial:
         return record_action("disconnect", False, "serial is required")
+    MANUAL_DISCONNECT_UNTIL[serial] = time.time() + 120
+
+    config = load_config()
+    device_config = configured_devices(config).get(serial, {})
+    if platform.system().lower() == "linux" and device_config.get("uhubctl"):
+        result = power_off_linux_hub_port(serial, device_config)
+        verified, last_state = wait_for_adb_absent(serial)
+        return record_action(
+            "disconnect",
+            result["ok"] and verified,
+            f"hub port power off requested; adb verification={'absent' if verified else 'still ' + last_state}; {result['message']}",
+            serial,
+        )
+
     if not shutil.which("adb"):
         return record_action("disconnect", False, "adb is not installed or not on PATH", serial)
     command = ["adb", "-s", serial, "shell", "svc", "usb", "setFunctions", "none"]
     result = run_command(command, timeout=8)
     output = (result.stdout + result.stderr).strip()
+    verified, last_state = wait_for_adb_absent(serial)
     if result.returncode == 0:
-        return record_action("disconnect", True, output or "USB data functions disabled on device", serial)
+        if verified:
+            return record_action(
+                "disconnect",
+                True,
+                f"Android USB data disable requested and verified absent from adb; command output: {output or '-'}",
+                serial,
+            )
+        return record_action(
+            "disconnect",
+            False,
+            "Android accepted the USB data disable command, but adb still reports "
+            f"the device as {last_state}. This phone may ignore svc usb setFunctions none; "
+            "configure a uhubctl-controlled hub port for a true computer-side disconnect.",
+            serial,
+        )
     fallback = run_command(["adb", "kill-server"], timeout=8)
     fallback_output = (fallback.stdout + fallback.stderr).strip()
     return record_action(
@@ -530,6 +598,8 @@ def auto_reconnect_if_needed(devices: list[dict[str, Any]], config: dict[str, An
     now = time.time()
     for device in devices:
         serial = device["serial"]
+        if now < MANUAL_DISCONNECT_UNTIL.get(serial, 0):
+            continue
         if device["state"] not in {"offline", "unknown"}:
             continue
         if now - AUTO_RECONNECT_ATTEMPTS.get(serial, 0) < interval_seconds:
@@ -539,6 +609,8 @@ def auto_reconnect_if_needed(devices: list[dict[str, Any]], config: dict[str, An
 
     current_serials = {device["serial"] for device in devices}
     for serial in configured_devices(config):
+        if now < MANUAL_DISCONNECT_UNTIL.get(serial, 0):
+            continue
         if serial in current_serials:
             continue
         if now - AUTO_RECONNECT_ATTEMPTS.get(serial, 0) < interval_seconds:
@@ -730,6 +802,9 @@ INDEX_HTML = """<!doctype html>
       });
       await response.json();
       await refresh();
+      refreshLater(1500);
+      refreshLater(3500);
+      refreshLater(6500);
     }
 
     function androidCard(device) {
@@ -745,7 +820,7 @@ INDEX_HTML = """<!doctype html>
         <div class="actions">
           <button onclick="doAction('reconnect', '${device.serial}')">Reconnect</button>
           <button onclick="doAction('recover', '${device.serial}')">Recover</button>
-          <button class="danger" onclick="doAction('disconnect', '${device.serial}')">Disconnect USB data</button>
+          <button class="danger" onclick="doAction('disconnect', '${device.serial}')">Disconnect and verify</button>
         </div>
       </article>`;
     }
@@ -806,6 +881,10 @@ INDEX_HTML = """<!doctype html>
       actionsEl.innerHTML = state.last_actions.length
         ? state.last_actions.map(actionCard).join("")
         : `<article class="device"><div class="name">No actions yet</div></article>`;
+    }
+
+    function refreshLater(delayMs) {
+      window.setTimeout(refresh, delayMs);
     }
 
     refresh();

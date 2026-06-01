@@ -58,6 +58,11 @@ After a successful `Disconnect and verify`, the device moves to the missing list
 `Power on / Connect` button. `Restart ADB discovery` only restarts ADB; it does not power a Hub
 port back on.
 
+The monitor also stores learned phone-to-Hub mappings in `usb_android_monitor_state.json`. This
+matters after a real power-off: once the phone is gone from ADB, the app cannot rediscover its
+Hub port from the phone itself. If the state file exists, restarting the service still shows the
+powered-off phone in the missing list and can run `uhubctl -a on` for the remembered port.
+
 Copy the example config and fill in your real device serials:
 
 ```sh

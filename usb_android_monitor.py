@@ -64,6 +64,7 @@ AUTO_RECONNECT_ATTEMPTS: dict[str, float] = {}
 MANUAL_DISCONNECT_UNTIL: dict[str, float] = {}
 DISCONNECTED_TARGETS: dict[str, dict[str, str]] = {}
 CONFIG_PATH = os.environ.get("USB_ANDROID_MONITOR_CONFIG", "usb_android_monitor_config.json")
+STATE_PATH = os.environ.get("USB_ANDROID_MONITOR_STATE", "usb_android_monitor_state.json")
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,48 @@ def load_config(path: str = CONFIG_PATH) -> dict[str, Any]:
 def configured_devices(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     devices = config.get("devices", {})
     return devices if isinstance(devices, dict) else {}
+
+
+def load_state(path: str = STATE_PATH) -> dict[str, Any]:
+    if not os.path.exists(path):
+        return {"known_devices": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"known_devices": {}}
+    if not isinstance(state, dict):
+        return {"known_devices": {}}
+    state.setdefault("known_devices", {})
+    if not isinstance(state["known_devices"], dict):
+        state["known_devices"] = {}
+    return state
+
+
+def save_state(state: dict[str, Any], path: str = STATE_PATH) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def remember_known_device(serial: str, data: dict[str, Any]) -> None:
+    if not serial:
+        return
+    with ACTION_LOCK:
+        state = load_state()
+        known = state.setdefault("known_devices", {})
+        current = known.get(serial, {})
+        current.update(data)
+        current["last_seen_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        known[serial] = current
+        save_state(state)
+
+
+def known_devices_snapshot() -> dict[str, dict[str, Any]]:
+    with ACTION_LOCK:
+        return dict(load_state().get("known_devices", {}))
 
 
 def split_vendor(raw: str) -> tuple[str, str]:
@@ -399,6 +442,14 @@ def uhubctl_target_for_serial(serial: str, config: dict[str, Any]) -> dict[str, 
         remembered = DISCONNECTED_TARGETS.get(serial)
     if remembered:
         return dict(remembered)
+    known = known_devices_snapshot().get(serial, {})
+    known_target = known.get("uhubctl_target", {})
+    if known_target.get("location") and known_target.get("port"):
+        return {
+            "location": str(known_target["location"]),
+            "port": str(known_target["port"]),
+            "source": str(known_target.get("source") or "state"),
+        }
     adb_device = get_adb_device(serial)
     if not adb_device:
         return {}
@@ -414,11 +465,26 @@ def remember_disconnected_target(serial: str, target: dict[str, Any]) -> None:
             "port": str(target["port"]),
             "source": str(target.get("source") or "remembered"),
         }
+    remember_known_device(
+        serial,
+        {
+            "uhubctl_target": {
+                "location": str(target["location"]),
+                "port": str(target["port"]),
+                "source": str(target.get("source") or "remembered"),
+            },
+            "power_state": "off",
+        },
+    )
 
 
 def forget_disconnected_target(serial: str) -> None:
     with ACTION_LOCK:
         DISCONNECTED_TARGETS.pop(serial, None)
+    known = known_devices_snapshot().get(serial)
+    if known:
+        known["power_state"] = "on"
+        remember_known_device(serial, known)
 
 
 def explain_uhubctl_failure(output: str, target: dict[str, Any]) -> str:
@@ -617,6 +683,18 @@ def enrich_adb_with_usb(adb_devices: list[AdbDevice], usb_devices: list[UsbDevic
                 *row["hub_evidence"],
                 f"inferred uhubctl target: -l {inferred_uhubctl['location']} -p {inferred_uhubctl['port']}",
             ]
+            remember_known_device(
+                device.serial,
+                {
+                    "name": row["model"] or row["product"] or device.serial,
+                    "model": row["model"],
+                    "product": row["product"],
+                    "device": row["device"],
+                    "usb_path": row["usb_path"],
+                    "uhubctl_target": inferred_uhubctl,
+                    "power_state": "on",
+                },
+            )
         row["status_hint"] = return_hint
         enriched.append(row)
     return enriched
@@ -898,6 +976,7 @@ def snapshot() -> dict[str, Any]:
     current_serials = {device["serial"] for device in android_devices}
     for serial in current_serials:
         forget_disconnected_target(serial)
+    known_devices = known_devices_snapshot()
     missing_configured = [
         {
             "serial": serial,
@@ -910,6 +989,27 @@ def snapshot() -> dict[str, Any]:
         for serial, device_config in configured_devices(config).items()
         if serial not in current_serials
     ]
+    for serial, known in known_devices.items():
+        if serial in current_serials:
+            continue
+        if any(device["serial"] == serial for device in missing_configured):
+            continue
+        target = known.get("uhubctl_target", {})
+        if not target.get("location") or not target.get("port"):
+            continue
+        missing_configured.append(
+            {
+                "serial": serial,
+                "name": str(known.get("name") or known.get("model") or serial),
+                "recovery_plan": [
+                    f"uhubctl on location={target['location']} port={target['port']}",
+                    "adb reconnect",
+                ],
+                "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
+                "power_target": target,
+                "reason": str(known.get("power_state") or "known-missing"),
+            }
+        )
     with ACTION_LOCK:
         remembered_targets = {
             serial: dict(target)
@@ -987,7 +1087,7 @@ def print_table(state: dict[str, Any]) -> None:
         print("Android devices: none")
     if state["missing_configured_devices"]:
         print()
-        print("Configured devices missing from ADB:")
+        print("Missing / powered-off devices:")
         for device in state["missing_configured_devices"]:
             print(f"  {device['serial']} ({device['name']})")
             print(f"    recovery: {' -> '.join(device['recovery_plan'])}")
@@ -1080,7 +1180,7 @@ INDEX_HTML = """<!doctype html>
       <section>
         <h2 class="section-title">Android Devices</h2>
         <section class="devices" id="android"></section>
-        <h2 class="section-title">Configured Devices Missing From ADB</h2>
+        <h2 class="section-title">Missing / Powered Off Devices</h2>
         <section class="devices" id="missing"></section>
         <h2 class="section-title">USB / Hub Context</h2>
         <section class="devices" id="usb"></section>
@@ -1228,7 +1328,7 @@ INDEX_HTML = """<!doctype html>
       statsEl.innerHTML = [
         `<div class="stat ${state.summary.adb_android_devices ? "good" : "bad"}"><span>ADB Android</span><b>${state.summary.adb_android_devices}</b></div>`,
         stat("Behind hub", state.summary.android_behind_hub),
-        stat("Configured missing", state.summary.configured_missing),
+        stat("Missing / powered off", state.summary.configured_missing),
         stat("Needs attention", state.summary.attention),
         stat("USB hubs", state.summary.hubs)
       ].join("");
@@ -1240,7 +1340,7 @@ INDEX_HTML = """<!doctype html>
         : `<article class="device"><div class="name">No ADB Android devices detected</div><div class="meta">Connect the phone by USB, enable USB debugging, and authorize this computer.</div><div class="actions"><button onclick="doAction('reconnect')">Restart ADB discovery</button></div></article>`;
       missingEl.innerHTML = state.missing_configured_devices.length
         ? state.missing_configured_devices.map((device) => missingCard(device, state)).join("")
-        : `<article class="device ready"><div class="name">No configured devices are missing</div></article>`;
+        : `<article class="device ready"><div class="name">No missing or powered-off devices</div></article>`;
       usbEl.innerHTML = state.usb_devices.length
         ? state.usb_devices.map(usbCard).join("")
         : `<article class="device"><div class="name">No USB context available</div><div class="meta">Install lsusb on Ubuntu, or run on Windows with PowerShell available.</div></article>`;

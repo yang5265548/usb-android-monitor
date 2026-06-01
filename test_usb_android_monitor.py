@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from usb_android_monitor import (
     configured_devices,
@@ -7,6 +8,7 @@ from usb_android_monitor import (
     infer_uhubctl_target_from_usb_path,
     parse_adb_devices,
     recovery_plan_for_serial,
+    snapshot,
 )
 
 
@@ -111,6 +113,33 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
 
     def test_configured_devices_rejects_non_dict(self) -> None:
         self.assertEqual(configured_devices({"devices": []}), {})
+
+    def test_snapshot_lists_known_powered_off_device_as_missing(self) -> None:
+        known = {
+            "SERIAL1": {
+                "name": "Rack phone 1",
+                "power_state": "off",
+                "uhubctl_target": {
+                    "location": "2-2",
+                    "port": "3",
+                    "source": "state",
+                },
+            }
+        }
+
+        with (
+            patch("usb_android_monitor.load_config", return_value={"auto_recovery": {"enabled": False}, "devices": {}}),
+            patch("usb_android_monitor.get_usb_devices", return_value=([], "test-usb")),
+            patch("usb_android_monitor.get_adb_devices", return_value=[]),
+            patch("usb_android_monitor.known_devices_snapshot", return_value=known),
+            patch("usb_android_monitor.shutil.which", return_value="/usr/bin/adb"),
+        ):
+            state = snapshot()
+
+        self.assertEqual(state["summary"]["configured_missing"], 1)
+        self.assertEqual(state["missing_configured_devices"][0]["serial"], "SERIAL1")
+        self.assertEqual(state["missing_configured_devices"][0]["power_target"]["location"], "2-2")
+        self.assertIn("uhubctl on location=2-2 port=3", state["missing_configured_devices"][0]["recovery_plan"])
 
 
 if __name__ == "__main__":

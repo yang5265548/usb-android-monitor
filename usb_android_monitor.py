@@ -123,6 +123,7 @@ def run_action_async(action: str, serial: str) -> dict[str, Any]:
         "recover": recover_device,
         "verify": verify_device,
         "disconnect": disconnect_device,
+        "map-acroname": map_acroname_ports,
     }
     target = action_map.get(action)
     if target is None:
@@ -792,9 +793,9 @@ def reconnect_device(serial: str = "") -> dict[str, Any]:
 
 
 def recovery_plan_for_serial(serial: str, config: dict[str, Any]) -> list[str]:
-    device_config = configured_devices(config).get(serial, {})
     steps = ["adb start-server", "adb reconnect"]
-    acroname = acroname_control_for_device(device_config)
+    device_config = configured_devices(config).get(serial, {})
+    acroname = acroname_control_for_serial(serial, config)
     if acroname:
         steps.append(f"acroname {acroname.get('action', 'port')} cycle port={acroname['port']}")
     uhubctl = device_config.get("uhubctl", {})
@@ -815,7 +816,51 @@ def acroname_control_for_device(device_config: dict[str, Any]) -> dict[str, Any]
         return {}
     if "port" not in acroname:
         return {}
-    return dict(acroname)
+    control = dict(acroname)
+    control.setdefault("type", "acroname")
+    return control
+
+
+def acroname_control_for_serial(serial: str, config: dict[str, Any]) -> dict[str, Any]:
+    configured = acroname_control_for_device(configured_devices(config).get(serial, {}))
+    if configured:
+        configured.setdefault("source", "config")
+        return configured
+    known = known_devices_snapshot().get(serial, {})
+    known_control = known.get("acroname_control", {})
+    if isinstance(known_control, dict) and known_control.get("port") is not None:
+        control = dict(known_control)
+        control.setdefault("type", "acroname")
+        control.setdefault("source", "state")
+        return control
+    return {}
+
+
+def acroname_mapping_control(config: dict[str, Any]) -> dict[str, Any]:
+    hub_control = config.get("hub_control", {})
+    acroname = config.get("acroname", {})
+    if isinstance(hub_control, dict) and hub_control.get("type") == "acroname":
+        acroname = hub_control
+    if not isinstance(acroname, dict):
+        acroname = {}
+    control = dict(acroname)
+    control.setdefault("type", "acroname")
+    control.setdefault("model", "USBHub3c")
+    control.setdefault("ports", [1, 2, 3, 4, 5])
+    return control
+
+
+def acroname_control_for_port(mapping_control: dict[str, Any], port: int) -> dict[str, Any]:
+    control = {
+        "type": "acroname",
+        "model": mapping_control.get("model", "USBHub3c"),
+        "port": port,
+        "source": "auto-map",
+    }
+    for key in ("hub_serial", "serial_number", "cycle_delay_seconds"):
+        if mapping_control.get(key) not in {None, ""}:
+            control[key] = mapping_control[key]
+    return control
 
 
 def parse_acroname_serial(value: Any) -> int | None:
@@ -906,6 +951,89 @@ def run_acroname_port_action(serial: str, control: dict[str, Any], action: str) 
                 pass
 
 
+def adb_serials() -> set[str]:
+    return {device.serial for device in get_adb_devices() if device.serial and device.state != "absent"}
+
+
+def wait_for_serials_absent(serials: set[str], timeout_seconds: float = 8.0) -> set[str]:
+    deadline = time.time() + timeout_seconds
+    missing: set[str] = set()
+    while time.time() < deadline:
+        current = adb_serials()
+        missing = serials - current
+        if missing:
+            return missing
+        time.sleep(0.5)
+    return missing
+
+
+def wait_for_serials_present(serials: set[str], timeout_seconds: float = 25.0) -> set[str]:
+    deadline = time.time() + timeout_seconds
+    present: set[str] = set()
+    while time.time() < deadline:
+        current = adb_serials()
+        present = serials & current
+        if present == serials:
+            return present
+        time.sleep(1.0)
+    return present
+
+
+def map_acroname_ports(_: str = "") -> dict[str, Any]:
+    config = load_config()
+    mapping_control = acroname_mapping_control(config)
+    ports = [int(port) for port in mapping_control.get("ports", [])]
+    if not ports:
+        return record_action("map-acroname", False, "no Acroname ports configured for mapping")
+    baseline = adb_serials()
+    if not baseline:
+        return record_action("map-acroname", False, "no ADB devices are currently visible; connect phones first")
+
+    mapped: dict[str, int] = {}
+    messages: list[str] = [f"baseline adb devices={len(baseline)}", f"ports={ports}"]
+    for port in ports:
+        control = acroname_control_for_port(mapping_control, port)
+        before = adb_serials()
+        if not before:
+            messages.append(f"port {port}: skipped because no ADB devices were visible")
+            continue
+        off = run_acroname_port_action("", control, "off")
+        if not off["ok"]:
+            messages.append(f"port {port}: off failed: {off['message']}")
+            run_acroname_port_action("", control, "on")
+            continue
+        missing = wait_for_serials_absent(before)
+        on = run_acroname_port_action("", control, "on")
+        returned = wait_for_serials_present(missing) if missing else set()
+        if missing:
+            for serial in sorted(missing):
+                learned = dict(control)
+                learned["source"] = "auto-map"
+                remember_known_device(
+                    serial,
+                    {
+                        "name": serial,
+                        "acroname_control": learned,
+                        "power_state": "on" if serial in returned else "unknown",
+                    },
+                )
+                mapped[serial] = port
+            messages.append(
+                f"port {port}: mapped {', '.join(sorted(missing))}; "
+                f"return={'ok' if returned == missing else 'partial'}; on={on['status']}"
+            )
+        else:
+            messages.append(f"port {port}: no ADB serial disappeared")
+        time.sleep(1.0)
+    ok = bool(mapped)
+    return record_action(
+        "map-acroname",
+        ok,
+        f"mapped {len(mapped)} device(s): {mapped}; " + " | ".join(messages),
+        status="ok" if ok else "failed",
+    )
+
+
 def power_cycle_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
     uhubctl = device_config.get("uhubctl", device_config)
     if not uhubctl.get("location") or not uhubctl.get("port"):
@@ -992,7 +1120,7 @@ def recover_device(serial: str = "", reason: str = "manual", allow_power_cycle: 
 
     system = platform.system().lower()
     if allow_power_cycle and serial:
-        acroname = acroname_control_for_device(device_config)
+        acroname = acroname_control_for_serial(serial, config)
         if acroname:
             result = run_acroname_port_action(serial, acroname, "cycle")
             messages.append(result["message"])
@@ -1019,10 +1147,9 @@ def connect_device(serial: str) -> dict[str, Any]:
     if not serial:
         return record_action("connect", False, "serial is required")
     config = load_config()
-    device_config = configured_devices(config).get(serial, {})
     messages: list[str] = []
     ok = False
-    acroname = acroname_control_for_device(device_config)
+    acroname = acroname_control_for_serial(serial, config)
     if acroname:
         result = run_acroname_port_action(serial, acroname, "on")
         messages.append(f"acroname port power/data on: {result['message']}")
@@ -1087,9 +1214,9 @@ def disconnect_device(serial: str) -> dict[str, Any]:
     MANUAL_DISCONNECT_UNTIL[serial] = time.time() + 120
 
     config = load_config()
-    device_config = configured_devices(config).get(serial, {})
-    acroname = acroname_control_for_device(device_config)
+    acroname = acroname_control_for_serial(serial, config)
     if acroname:
+        remember_known_device(serial, {"acroname_control": dict(acroname), "power_state": "off"})
         result = run_acroname_port_action(serial, acroname, "off")
         verified, last_state = wait_for_adb_absent(serial)
         return record_action(
@@ -1194,6 +1321,8 @@ def snapshot() -> dict[str, Any]:
     android_devices = enrich_adb_with_usb(adb_devices, usb_devices)
     record_adb_device_events(android_devices)
     auto_reconnect_if_needed(android_devices, config)
+    for device in android_devices:
+        device["acroname_control"] = acroname_control_for_serial(device["serial"], config)
     usb_android = [device for device in usb_devices if device.is_android_candidate]
     current_serials = {device["serial"] for device in android_devices}
     for serial in current_serials:
@@ -1205,7 +1334,7 @@ def snapshot() -> dict[str, Any]:
             "name": str(device_config.get("name") or serial),
             "recovery_plan": recovery_plan_for_serial(serial, config),
             "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
-            "power_target": uhubctl_target_for_serial(serial, config),
+            "power_target": acroname_control_for_serial(serial, config) or uhubctl_target_for_serial(serial, config),
             "reason": "configured",
         }
         for serial, device_config in configured_devices(config).items()
@@ -1215,6 +1344,22 @@ def snapshot() -> dict[str, Any]:
         if serial in current_serials:
             continue
         if any(device["serial"] == serial for device in missing_configured):
+            continue
+        target = known.get("acroname_control", {})
+        if target.get("port") is not None:
+            missing_configured.append(
+                {
+                    "serial": serial,
+                    "name": str(known.get("name") or known.get("model") or serial),
+                    "recovery_plan": [
+                        f"acroname on port={target['port']}",
+                        "adb reconnect",
+                    ],
+                    "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
+                    "power_target": target,
+                    "reason": str(known.get("power_state") or "known-missing"),
+                }
+            )
             continue
         target = known.get("uhubctl_target", {})
         if not target.get("location") or not target.get("port"):
@@ -1462,7 +1607,9 @@ INDEX_HTML = """<!doctype html>
       const cls = active ? "running" : device.needs_attention ? "warn" : "ready";
       const hub = device.behind_hub ? "Behind hub" : "Hub unknown";
       const evidence = device.hub_evidence.length ? `<div class="meta">Hub evidence: ${device.hub_evidence.join("; ")}</div>` : "";
-      const hubControl = device.uhubctl_target && device.uhubctl_target.location
+      const hubControl = device.acroname_control && device.acroname_control.port !== undefined
+        ? `<div class="hint">Hub control target: Acroname ${device.acroname_control.model || "USBHub3c"} port ${device.acroname_control.port} (${device.acroname_control.source || "state"})</div>`
+        : device.uhubctl_target && device.uhubctl_target.location
         ? `<div class="hint">Hub control target: uhubctl -l ${device.uhubctl_target.location} -p ${device.uhubctl_target.port} (${device.uhubctl_target.source})</div>`
         : `<div class="hint">No controllable Hub port inferred yet. Disconnect will fall back to Android-side USB data disable.</div>`;
       const disabled = active ? "disabled" : "";
@@ -1485,7 +1632,9 @@ INDEX_HTML = """<!doctype html>
     function missingCard(device, state) {
       const active = isSerialActive(state, device.serial);
       const disabled = active ? "disabled" : "";
-      const target = device.power_target && device.power_target.location
+      const target = device.power_target && device.power_target.type === "acroname"
+        ? `<div class="hint">Power target: Acroname ${device.power_target.model || "USBHub3c"} port ${device.power_target.port} (${device.power_target.source || "state"})</div>`
+        : device.power_target && device.power_target.location
         ? `<div class="hint">Power target: uhubctl -l ${device.power_target.location} -p ${device.power_target.port} (${device.power_target.source})</div>`
         : `<div class="hint">No Hub power target is known for this missing device.</div>`;
       return `<article class="device warn">
@@ -1543,7 +1692,7 @@ INDEX_HTML = """<!doctype html>
       const state = await response.json();
       updatedEl.textContent = `Updated ${state.timestamp} · ${state.platform} · USB backend ${state.usb_backend} · ADB ${state.adb_available ? "available" : "not installed"}`;
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Configured devices: ${state.configured_device_count}. Config file: ${state.config_path}.`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Configured devices: ${state.configured_device_count}. Config file: ${state.config_path}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Auto-map Acroname ports</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")
@@ -1665,6 +1814,8 @@ def main() -> int:
     disconnect_parser = subparsers.add_parser("disconnect", help="try to disable USB data on one Android device")
     disconnect_parser.add_argument("serial")
 
+    subparsers.add_parser("map-acroname", help="auto-map Acroname ports to visible ADB serials")
+
     args = parser.parse_args()
     if args.command == "list":
         print_table(snapshot())
@@ -1682,6 +1833,8 @@ def main() -> int:
         print(json.dumps(verify_device(args.serial), ensure_ascii=False, indent=2))
     elif args.command == "disconnect":
         print(json.dumps(disconnect_device(args.serial), ensure_ascii=False, indent=2))
+    elif args.command == "map-acroname":
+        print(json.dumps(map_acroname_ports(), ensure_ascii=False, indent=2))
     return 0
 
 

@@ -43,9 +43,13 @@ For Ubuntu, use a Hub supported by `uhubctl` if you need software-controlled unp
 For Win11, the app can attempt a `pnputil /restart-device` for a configured USB instance id,
 but true per-port power cycling depends on the Hub hardware and driver.
 
-For Acroname hubs on Win11, install the BrainStem Python package and configure each phone with
-its Acroname port. The BrainStem port number is zero-based. For example, if discovery reports
-`serial:C194E2FB`, configure `hub_serial` as `0xC194E2FB`.
+For Acroname hubs on Win11, install the BrainStem Python package and use the dashboard's
+`Auto-map Acroname ports` action. It briefly disables each Acroname port, watches which ADB
+serial disappears, re-enables the port, and saves the learned serial-to-port mapping in
+`usb_android_monitor_state.json`. The BrainStem port number is zero-based. For example, if
+discovery reports `serial:C194E2FB`, configure `hub_serial` as `0xC194E2FB` once at the hub level.
+The default scan list skips port 0 because it is often the upstream host port; include port 0
+only if you know it is safe in your setup.
 
 On Linux, the app can infer a likely `uhubctl` target from ADB USB paths. For example,
 `usb:1-2.2` maps to `uhubctl -l 1-2 -p 2`, and `usb:2-2.3` maps to
@@ -66,7 +70,8 @@ return in ADB before marking the connect action as failed.
 The monitor also stores learned phone-to-Hub mappings in `usb_android_monitor_state.json`. This
 matters after a real power-off: once the phone is gone from ADB, the app cannot rediscover its
 Hub port from the phone itself. If the state file exists, restarting the service still shows the
-powered-off phone in the missing list and can run `uhubctl -a on` for the remembered port.
+powered-off phone in the missing list and can run the remembered `uhubctl` or Acroname power-on
+operation.
 
 Copy the example config and fill in your real device serials:
 
@@ -83,15 +88,14 @@ Example:
     "cooldown_seconds": 60,
     "power_cycle_missing": false
   },
+  "acroname": {
+    "model": "USBHub3c",
+    "hub_serial": "0xC194E2FB",
+    "ports": [1, 2, 3, 4, 5]
+  },
   "devices": {
     "R58N123456": {
       "name": "Pixel 6 rack slot 1",
-      "hub_control": {
-        "type": "acroname",
-        "model": "USBHub3c",
-        "hub_serial": "0xC194E2FB",
-        "port": 0
-      },
       "uhubctl": {
         "enabled": true,
         "location": "1-1",
@@ -123,6 +127,8 @@ Open the dashboard at <http://127.0.0.1:8765> after running `serve`.
 - `serve`: start a local HTTP dashboard and JSON API with reconnect controls.
 - `reconnect --serial SERIAL`: restart the ADB transport for one phone.
 - `reconnect`: restart ADB discovery for all phones.
+- `map-acroname`: auto-map Acroname ports to currently visible ADB serials. This briefly
+  disconnects each Acroname port, so run it only when phones are idle.
 - `connect SERIAL`: power on a remembered/configured Hub port, then restart ADB discovery.
 - `recover SERIAL`: run the full recovery ladder for a configured phone.
 - `verify SERIAL`: verify whether the serial is absent from `adb devices`.

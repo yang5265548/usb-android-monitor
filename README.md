@@ -43,6 +43,10 @@ For Ubuntu, use a Hub supported by `uhubctl` if you need software-controlled unp
 For Win11, the app can attempt a `pnputil /restart-device` for a configured USB instance id,
 but true per-port power cycling depends on the Hub hardware and driver.
 
+For Acroname hubs on Win11, install the BrainStem Python package and configure each phone with
+its Acroname port. The BrainStem port number is zero-based. For example, if discovery reports
+`serial:C194E2FB`, configure `hub_serial` as `0xC194E2FB`.
+
 On Linux, the app can infer a likely `uhubctl` target from ADB USB paths. For example,
 `usb:1-2.2` maps to `uhubctl -l 1-2 -p 2`, and `usb:2-2.3` maps to
 `uhubctl -l 2-2 -p 3`. The dashboard shows this inferred command on each phone card.
@@ -82,6 +86,12 @@ Example:
   "devices": {
     "R58N123456": {
       "name": "Pixel 6 rack slot 1",
+      "hub_control": {
+        "type": "acroname",
+        "model": "USBHub3c",
+        "hub_serial": "0xC194E2FB",
+        "port": 0
+      },
       "uhubctl": {
         "enabled": true,
         "location": "1-1",
@@ -120,6 +130,12 @@ Open the dashboard at <http://127.0.0.1:8765> after running `serve`.
   on Linux, this powers off that port and verifies the serial disappears from ADB. Otherwise it
   falls back to `adb shell svc usb setFunctions none` and reports failure if ADB still sees the
   phone afterward.
+
+Install BrainStem on Win11:
+
+```powershell
+python -m pip install --user --upgrade brainstem
+```
 
 ## Notes
 

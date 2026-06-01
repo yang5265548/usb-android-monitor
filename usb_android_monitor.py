@@ -794,6 +794,9 @@ def reconnect_device(serial: str = "") -> dict[str, Any]:
 def recovery_plan_for_serial(serial: str, config: dict[str, Any]) -> list[str]:
     device_config = configured_devices(config).get(serial, {})
     steps = ["adb start-server", "adb reconnect"]
+    acroname = acroname_control_for_device(device_config)
+    if acroname:
+        steps.append(f"acroname {acroname.get('action', 'port')} cycle port={acroname['port']}")
     uhubctl = device_config.get("uhubctl", {})
     if uhubctl.get("enabled", True) and uhubctl.get("location") and uhubctl.get("port"):
         steps.append(f"uhubctl cycle location={uhubctl['location']} port={uhubctl['port']}")
@@ -801,6 +804,106 @@ def recovery_plan_for_serial(serial: str, config: dict[str, Any]) -> list[str]:
     if windows_instance_id:
         steps.append(f"pnputil restart-device {windows_instance_id}")
     return steps
+
+
+def acroname_control_for_device(device_config: dict[str, Any]) -> dict[str, Any]:
+    hub_control = device_config.get("hub_control", {})
+    acroname = device_config.get("acroname", {})
+    if isinstance(hub_control, dict) and hub_control.get("type") == "acroname":
+        acroname = hub_control
+    if not isinstance(acroname, dict) or not acroname.get("enabled", True):
+        return {}
+    if "port" not in acroname:
+        return {}
+    return dict(acroname)
+
+
+def parse_acroname_serial(value: Any) -> int | None:
+    if value in {None, ""}:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower().startswith("0x"):
+        return int(text, 16)
+    try:
+        return int(text, 10)
+    except ValueError:
+        return int(text, 16)
+
+
+def acroname_hub_class(brainstem: Any, hub_model: str) -> Any:
+    model = hub_model or "USBHub3c"
+    if not hasattr(brainstem.stem, model):
+        raise RuntimeError(f"unsupported Acroname hub model {model}")
+    return getattr(brainstem.stem, model)
+
+
+def acroname_no_error_value(brainstem: Any) -> Any:
+    result = getattr(brainstem, "Result", None)
+    if result is not None and hasattr(result, "NO_ERROR"):
+        return result.NO_ERROR
+    from brainstem.result import Result
+
+    return Result.NO_ERROR
+
+
+def run_acroname_port_action(serial: str, control: dict[str, Any], action: str) -> dict[str, Any]:
+    try:
+        port = int(control["port"])
+        hub_model = str(control.get("model") or "USBHub3c")
+        hub_serial = parse_acroname_serial(control.get("hub_serial") or control.get("serial_number"))
+        import brainstem
+
+        no_error = acroname_no_error_value(brainstem)
+    except ImportError as exc:
+        return record_action(
+            f"acroname-port-{action}",
+            False,
+            f"brainstem Python package is not installed or not on PYTHONPATH: {exc}",
+            serial,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return record_action(f"acroname-port-{action}", False, f"invalid Acroname config: {exc}", serial)
+
+    hub = None
+    try:
+        hub = acroname_hub_class(brainstem, hub_model)()
+        if hub_serial is None:
+            result = hub.discoverAndConnect(brainstem.link.Spec.USB)
+        else:
+            result = hub.discoverAndConnect(brainstem.link.Spec.USB, hub_serial)
+        if result != no_error:
+            return record_action(
+                f"acroname-port-{action}",
+                False,
+                f"could not connect to Acroname {hub_model}; result={result}",
+                serial,
+            )
+        if action == "off":
+            err = hub.usb.setPortDisable(port)
+        elif action == "on":
+            err = hub.usb.setPortEnable(port)
+        elif action == "cycle":
+            err = hub.usb.setPortDisable(port)
+            if err == no_error:
+                time.sleep(float(control.get("cycle_delay_seconds", 2)))
+                err = hub.usb.setPortEnable(port)
+        else:
+            return record_action(f"acroname-port-{action}", False, f"unsupported Acroname action {action}", serial)
+        ok = err == no_error
+        message = f"Acroname {hub_model} port {port} {action}; result={err}"
+        return record_action(f"acroname-port-{action}", ok, message, serial)
+    except Exception as exc:
+        return record_action(f"acroname-port-{action}", False, f"Acroname control failed: {exc}", serial)
+    finally:
+        if hub is not None:
+            try:
+                hub.disconnect()
+            except Exception:
+                pass
 
 
 def power_cycle_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
@@ -889,7 +992,13 @@ def recover_device(serial: str = "", reason: str = "manual", allow_power_cycle: 
 
     system = platform.system().lower()
     if allow_power_cycle and serial:
-        if system == "linux":
+        acroname = acroname_control_for_device(device_config)
+        if acroname:
+            result = run_acroname_port_action(serial, acroname, "cycle")
+            messages.append(result["message"])
+            time.sleep(2)
+            messages.append(reconnect_device(serial)["message"])
+        elif system == "linux":
             uhubctl_target = uhubctl_target_for_serial(serial, config)
             if uhubctl_target:
                 result = power_cycle_linux_hub_port(serial, uhubctl_target)
@@ -910,9 +1019,33 @@ def connect_device(serial: str) -> dict[str, Any]:
     if not serial:
         return record_action("connect", False, "serial is required")
     config = load_config()
+    device_config = configured_devices(config).get(serial, {})
     messages: list[str] = []
     ok = False
-    if platform.system().lower() == "linux":
+    acroname = acroname_control_for_device(device_config)
+    if acroname:
+        result = run_acroname_port_action(serial, acroname, "on")
+        messages.append(f"acroname port power/data on: {result['message']}")
+        ok = result["ok"]
+        if ok:
+            MANUAL_DISCONNECT_UNTIL.pop(serial, None)
+            messages.append(reconnect_device(serial)["message"])
+            present, state = wait_for_adb_present(serial)
+            if present:
+                forget_disconnected_target(serial)
+                return record_action(
+                    "connect",
+                    True,
+                    f"{' | '.join(messages)} | adb returned within wait window; state={state}",
+                    serial,
+                )
+            return record_action(
+                "connect",
+                False,
+                f"{' | '.join(messages)} | Acroname port is on, but serial stayed absent from adb after 25s",
+                serial,
+            )
+    elif platform.system().lower() == "linux":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:
             result = power_on_linux_hub_port(serial, uhubctl_target)
@@ -954,6 +1087,18 @@ def disconnect_device(serial: str) -> dict[str, Any]:
     MANUAL_DISCONNECT_UNTIL[serial] = time.time() + 120
 
     config = load_config()
+    device_config = configured_devices(config).get(serial, {})
+    acroname = acroname_control_for_device(device_config)
+    if acroname:
+        result = run_acroname_port_action(serial, acroname, "off")
+        verified, last_state = wait_for_adb_absent(serial)
+        return record_action(
+            "disconnect",
+            result["ok"] and verified,
+            "Acroname port disable requested; adb verification="
+            f"{'absent' if verified else 'still ' + last_state}; {result['message']}",
+            serial,
+        )
     if platform.system().lower() == "linux":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:

@@ -7,6 +7,12 @@
   "devices": {
     "R58N123456": {
       "name": "Pixel 6 rack slot 1",
+      "hub_control": {
+        "type": "acroname",
+        "model": "USBHub3c",
+        "hub_serial": "0xC194E2FB",
+        "port": 0
+      },
       "uhubctl": {
         "enabled": true,
         "location": "1-1",

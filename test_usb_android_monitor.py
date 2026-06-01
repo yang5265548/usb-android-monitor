@@ -8,6 +8,7 @@ from usb_android_monitor import (
     hub_evidence_from_adb_usb_path,
     infer_uhubctl_target_from_usb_path,
     last_actions_snapshot,
+    parse_acroname_serial,
     parse_adb_devices,
     record_adb_device_events,
     recovery_plan_for_serial,
@@ -121,6 +122,29 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertIn("adb reconnect", plan)
         self.assertIn("uhubctl cycle location=1-1 port=2", plan)
         self.assertIn("pnputil restart-device USB\\VID_18D1&PID_4EE7\\R58N123456", plan)
+
+    def test_recovery_plan_includes_acroname_port(self) -> None:
+        config = {
+            "devices": {
+                "R58N123456": {
+                    "hub_control": {
+                        "type": "acroname",
+                        "model": "USBHub3c",
+                        "hub_serial": "0xC194E2FB",
+                        "port": 0,
+                    }
+                }
+            }
+        }
+
+        plan = recovery_plan_for_serial("R58N123456", config)
+
+        self.assertIn("acroname port cycle port=0", plan)
+
+    def test_parse_acroname_serial_accepts_hex_and_decimal(self) -> None:
+        self.assertEqual(parse_acroname_serial("0xC194E2FB"), 3247760123)
+        self.assertEqual(parse_acroname_serial("C194E2FB"), 3247760123)
+        self.assertEqual(parse_acroname_serial(123), 123)
 
     def test_configured_devices_rejects_non_dict(self) -> None:
         self.assertEqual(configured_devices({"devices": []}), {})

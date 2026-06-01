@@ -7,7 +7,7 @@
   "acroname": {
     "model": "USBHub3c",
     "hub_serial": "0xC194E2FB",
-    "ports": [0, 1, 2, 3, 4, 5]
+    "ports": [1, 2, 3, 4, 5]
   },
   "devices": {
     "R58N123456": {

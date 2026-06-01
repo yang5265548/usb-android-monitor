@@ -11,6 +11,8 @@ from usb_android_monitor import (
     hub_evidence_from_adb_usb_path,
     infer_uhubctl_target_from_usb_path,
     last_actions_snapshot,
+    map_acroname_ports,
+    normalized_acroname_ports,
     parse_acroname_serial,
     parse_adb_devices,
     record_adb_device_events,
@@ -167,8 +169,47 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(control["port"], 4)
         self.assertEqual(control["source"], "state")
 
-    def test_acroname_mapping_defaults_include_port_zero(self) -> None:
-        self.assertEqual(acroname_mapping_control({})["ports"], [0, 1, 2, 3, 4, 5])
+    def test_acroname_mapping_defaults_skip_port_zero(self) -> None:
+        self.assertEqual(acroname_mapping_control({})["ports"], [1, 2, 3, 4, 5])
+
+    def test_normalized_acroname_ports_scans_zero_last(self) -> None:
+        self.assertEqual(normalized_acroname_ports([0, 3, 1, 0]), [1, 3, 0])
+
+    def test_acroname_map_aborts_when_failed_action_changes_adb_state(self) -> None:
+        with (
+            patch("usb_android_monitor.load_config", return_value={"acroname": {"ports": [0]}, "devices": {}}),
+            patch("usb_android_monitor.adb_serials", side_effect=[{"A", "B"}, {"A", "B"}, set()]),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                side_effect=[
+                    {"ok": False, "status": "failed", "message": "off failed"},
+                    {"ok": False, "status": "failed", "message": "on failed"},
+                ],
+            ),
+        ):
+            result = map_acroname_ports()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("aborted", result["message"])
+
+    def test_acroname_map_aborts_on_ambiguous_port(self) -> None:
+        with (
+            patch("usb_android_monitor.load_config", return_value={"acroname": {"ports": [1]}, "devices": {}}),
+            patch("usb_android_monitor.adb_serials", side_effect=[{"A", "B"}, {"A", "B"}, set(), {"A", "B"}]),
+            patch("usb_android_monitor.wait_for_serials_absent", return_value={"A", "B"}),
+            patch("usb_android_monitor.wait_for_serials_present", return_value={"A", "B"}),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                side_effect=[
+                    {"ok": True, "status": "ok", "message": "off ok"},
+                    {"ok": True, "status": "ok", "message": "on ok"},
+                ],
+            ),
+        ):
+            result = map_acroname_ports()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("multiple ADB serials", result["message"])
 
     def test_windows_acroname_without_mapping_does_not_use_android_fallback(self) -> None:
         with (

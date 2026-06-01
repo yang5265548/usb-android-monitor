@@ -846,8 +846,15 @@ def acroname_mapping_control(config: dict[str, Any]) -> dict[str, Any]:
     control = dict(acroname)
     control.setdefault("type", "acroname")
     control.setdefault("model", "USBHub3c")
-    control.setdefault("ports", [0, 1, 2, 3, 4, 5])
+    control.setdefault("ports", [1, 2, 3, 4, 5])
     return control
+
+
+def normalized_acroname_ports(raw_ports: Any) -> list[int]:
+    ports = sorted({int(port) for port in raw_ports})
+    if 0 in ports:
+        ports = [port for port in ports if port != 0] + [0]
+    return ports
 
 
 def brainstem_available() -> bool:
@@ -990,7 +997,7 @@ def wait_for_serials_present(serials: set[str], timeout_seconds: float = 25.0) -
 def map_acroname_ports(_: str = "") -> dict[str, Any]:
     config = load_config()
     mapping_control = acroname_mapping_control(config)
-    ports = [int(port) for port in mapping_control.get("ports", [])]
+    ports = normalized_acroname_ports(mapping_control.get("ports", []))
     if not ports:
         return record_action("map-acroname", False, "no Acroname ports configured for mapping")
     baseline = adb_serials()
@@ -1008,17 +1015,35 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
         off = run_acroname_port_action("", control, "off")
         if not off["ok"]:
             messages.append(f"port {port}: off failed: {off['message']}")
-            run_acroname_port_action("", control, "on")
+            on = run_acroname_port_action("", control, "on")
+            current = adb_serials()
+            if current != before or not on["ok"]:
+                return record_action(
+                    "map-acroname",
+                    False,
+                    "aborted because an Acroname port action failed and device state changed; "
+                    f"port={port}; before={sorted(before)}; current={sorted(current)}; "
+                    f"off={off['message']}; on={on['message']}",
+                )
             continue
         missing = wait_for_serials_absent(before)
         on = run_acroname_port_action("", control, "on")
         returned = wait_for_serials_present(missing) if missing else set()
         if len(missing) > 1:
-            messages.append(
-                f"port {port}: ambiguous, multiple ADB serials disappeared "
-                f"({', '.join(sorted(missing))}); not saving a mapping"
+            return record_action(
+                "map-acroname",
+                False,
+                "aborted because one Acroname port affected multiple ADB serials; "
+                f"port={port}; disappeared={sorted(missing)}; on={on['message']}",
             )
         elif missing:
+            if not on["ok"] or returned != missing:
+                return record_action(
+                    "map-acroname",
+                    False,
+                    "aborted because the mapped device did not fully return after re-enabling the port; "
+                    f"port={port}; disappeared={sorted(missing)}; returned={sorted(returned)}; on={on['message']}",
+                )
             for serial in sorted(missing):
                 learned = dict(control)
                 learned["source"] = "auto-map"

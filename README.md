@@ -48,8 +48,9 @@ For Acroname hubs on Win11, install the BrainStem Python package and use the das
 serial disappears, re-enables the port, and saves the learned serial-to-port mapping in
 `usb_android_monitor_state.json`. The BrainStem port number is zero-based. For example, if
 discovery reports `serial:C194E2FB`, configure `hub_serial` as `0xC194E2FB` once at the hub level.
-The default scan list includes port 0. If port 0 is an upstream host port in your setup, remove it
-from the configured `ports` list before auto-mapping.
+The default scan list skips port 0 because on USBHub3c it is often the upstream/control path.
+If you explicitly add port 0 to the configured `ports` list, the mapper scans it last and aborts
+if that port drops multiple ADB devices or prevents the hub from reconnecting.
 
 On Linux, the app can infer a likely `uhubctl` target from ADB USB paths. For example,
 `usb:1-2.2` maps to `uhubctl -l 1-2 -p 2`, and `usb:2-2.3` maps to
@@ -91,7 +92,7 @@ Example:
   "acroname": {
     "model": "USBHub3c",
     "hub_serial": "0xC194E2FB",
-    "ports": [0, 1, 2, 3, 4, 5]
+    "ports": [1, 2, 3, 4, 5]
   },
   "devices": {
     "R58N123456": {

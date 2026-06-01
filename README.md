@@ -56,7 +56,8 @@ topology but cannot be power-cycled by `uhubctl`.
 
 After a successful `Disconnect and verify`, the device moves to the missing list with a
 `Power on / Connect` button. `Restart ADB discovery` only restarts ADB; it does not power a Hub
-port back on.
+port back on. After powering a Hub port back on, the app waits up to 25 seconds for the serial to
+return in ADB before marking the connect action as failed.
 
 The monitor also stores learned phone-to-Hub mappings in `usb_android_monitor_state.json`. This
 matters after a real power-off: once the phone is gone from ADB, the app cannot rediscover its

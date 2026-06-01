@@ -9,6 +9,7 @@ from usb_android_monitor import (
     parse_adb_devices,
     recovery_plan_for_serial,
     snapshot,
+    wait_for_adb_present,
 )
 
 
@@ -140,6 +141,16 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(state["missing_configured_devices"][0]["serial"], "SERIAL1")
         self.assertEqual(state["missing_configured_devices"][0]["power_target"]["location"], "2-2")
         self.assertIn("uhubctl on location=2-2 port=3", state["missing_configured_devices"][0]["recovery_plan"])
+
+    def test_wait_for_adb_present_polls_until_serial_returns(self) -> None:
+        with (
+            patch("usb_android_monitor.adb_state_for_serial", side_effect=["absent", "absent", "device"]),
+            patch("usb_android_monitor.time.sleep"),
+        ):
+            present, state = wait_for_adb_present("SERIAL1", timeout_seconds=5)
+
+        self.assertTrue(present)
+        self.assertEqual(state, "device")
 
 
 if __name__ == "__main__":

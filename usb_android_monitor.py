@@ -523,6 +523,17 @@ def wait_for_adb_absent(serial: str, timeout_seconds: float = 6.0) -> tuple[bool
     return False, last_state
 
 
+def wait_for_adb_present(serial: str, timeout_seconds: float = 25.0) -> tuple[bool, str]:
+    deadline = time.time() + timeout_seconds
+    last_state = adb_state_for_serial(serial)
+    while time.time() < deadline:
+        last_state = adb_state_for_serial(serial)
+        if last_state != "absent":
+            return True, last_state
+        time.sleep(1.0)
+    return False, last_state
+
+
 def verify_device(serial: str) -> dict[str, Any]:
     if not serial:
         return record_action("verify", False, "serial is required")
@@ -849,24 +860,27 @@ def connect_device(serial: str) -> dict[str, Any]:
             ok = result["ok"]
             if ok:
                 MANUAL_DISCONNECT_UNTIL.pop(serial, None)
-                time.sleep(3)
                 messages.append(reconnect_device(serial)["message"])
-                state = adb_state_for_serial(serial)
-                if state != "absent":
+                present, state = wait_for_adb_present(serial)
+                if present:
                     forget_disconnected_target(serial)
-                    return record_action("connect", True, f"{' | '.join(messages)} | adb state={state}", serial)
+                    return record_action(
+                        "connect",
+                        True,
+                        f"{' | '.join(messages)} | adb returned within wait window; state={state}",
+                        serial,
+                    )
                 return record_action(
                     "connect",
                     False,
-                    f"{' | '.join(messages)} | hub port is on, but serial is still absent from adb",
+                    f"{' | '.join(messages)} | hub port is on, but serial stayed absent from adb after 25s",
                     serial,
                 )
         else:
             messages.append("no remembered or configured uhubctl target; only restarting ADB")
     MANUAL_DISCONNECT_UNTIL.pop(serial, None)
     messages.append(reconnect_device(serial)["message"])
-    state = adb_state_for_serial(serial)
-    ok = state != "absent"
+    ok, state = wait_for_adb_present(serial, timeout_seconds=12.0)
     if ok:
         forget_disconnected_target(serial)
     return record_action("connect", ok, f"{' | '.join(messages)} | adb state={state}", serial)

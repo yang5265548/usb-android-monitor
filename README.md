@@ -43,6 +43,12 @@ For Ubuntu, use a Hub supported by `uhubctl` if you need software-controlled unp
 For Win11, the app can attempt a `pnputil /restart-device` for a configured USB instance id,
 but true per-port power cycling depends on the Hub hardware and driver.
 
+On Linux, the app can infer a likely `uhubctl` target from ADB USB paths. For example,
+`usb:1-2.2` maps to `uhubctl -l 1-2 -p 2`, and `usb:2-2.3` maps to
+`uhubctl -l 2-2 -p 3`. The dashboard shows this inferred command on each phone card.
+If the Hub supports per-port power switching, `Disconnect and verify` uses that target before
+falling back to the less reliable Android-side USB data command.
+
 Copy the example config and fill in your real device serials:
 
 ```sh

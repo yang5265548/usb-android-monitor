@@ -57,6 +57,8 @@ ANDROID_TEXT_MARKERS = (
 HUB_TEXT_MARKERS = ("hub", "multiport", "dock", "adapter")
 
 LAST_ACTIONS: list[dict[str, Any]] = []
+ACTIVE_ACTIONS: dict[str, dict[str, Any]] = {}
+ACTION_LOCK = threading.Lock()
 AUTO_RECONNECT_ENABLED = True
 AUTO_RECONNECT_ATTEMPTS: dict[str, float] = {}
 MANUAL_DISCONNECT_UNTIL: dict[str, float] = {}
@@ -95,16 +97,18 @@ class AdbDevice:
     raw: str
 
 
-def record_action(action: str, ok: bool, message: str, serial: str = "") -> dict[str, Any]:
+def record_action(action: str, ok: bool, message: str, serial: str = "", status: str = "") -> dict[str, Any]:
     entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "action": action,
         "serial": serial,
         "ok": ok,
+        "status": status or ("ok" if ok else "failed"),
         "message": message,
     }
-    LAST_ACTIONS.insert(0, entry)
-    del LAST_ACTIONS[20:]
+    with ACTION_LOCK:
+        LAST_ACTIONS.insert(0, entry)
+        del LAST_ACTIONS[30:]
     return entry
 
 
@@ -118,9 +122,37 @@ def run_action_async(action: str, serial: str) -> dict[str, Any]:
     target = action_map.get(action)
     if target is None:
         return record_action(action or "unknown", False, "unsupported action", serial)
-    queued = record_action(f"{action}-queued", True, "action queued; final result will appear shortly", serial)
-    threading.Thread(target=target, args=(serial,), daemon=True).start()
+    action_id = f"{action}:{serial or 'all'}:{time.time()}"
+    started = {
+        "id": action_id,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "action": action,
+        "serial": serial,
+        "message": "running",
+    }
+    with ACTION_LOCK:
+        ACTIVE_ACTIONS[action_id] = started
+    queued = record_action(f"{action}-queued", True, "action queued; final result will appear shortly", serial, "running")
+
+    def worker() -> None:
+        try:
+            target(serial)
+        finally:
+            with ACTION_LOCK:
+                ACTIVE_ACTIONS.pop(action_id, None)
+
+    threading.Thread(target=worker, daemon=True).start()
     return queued
+
+
+def active_actions_snapshot() -> list[dict[str, Any]]:
+    with ACTION_LOCK:
+        return list(ACTIVE_ACTIONS.values())
+
+
+def last_actions_snapshot() -> list[dict[str, Any]]:
+    with ACTION_LOCK:
+        return list(LAST_ACTIONS)
 
 
 def run_command(args: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
@@ -279,6 +311,16 @@ def hub_evidence_from_adb_usb_path(usb_path: str) -> list[str]:
     return evidence if "." in path_only else []
 
 
+def infer_uhubctl_target_from_usb_path(usb_path: str) -> dict[str, str]:
+    path_only = usb_path.split(":", 1)[-1] if usb_path else ""
+    if "." not in path_only:
+        return {}
+    location, port = path_only.rsplit(".", 1)
+    if not location or not port.isdigit():
+        return {}
+    return {"location": location, "port": port, "source": f"adb usb path {usb_path}"}
+
+
 def get_adb_devices() -> list[AdbDevice]:
     if not shutil.which("adb"):
         return []
@@ -287,6 +329,28 @@ def get_adb_devices() -> list[AdbDevice]:
         record_action("adb devices", False, result.stderr.strip() or result.stdout.strip())
         return []
     return parse_adb_devices(result.stdout)
+
+
+def get_adb_device(serial: str) -> AdbDevice | None:
+    for device in get_adb_devices():
+        if device.serial == serial:
+            return device
+    return None
+
+
+def uhubctl_target_for_serial(serial: str, config: dict[str, Any]) -> dict[str, str]:
+    device_config = configured_devices(config).get(serial, {})
+    configured = device_config.get("uhubctl", {})
+    if configured.get("enabled", True) and configured.get("location") and configured.get("port"):
+        return {
+            "location": str(configured["location"]),
+            "port": str(configured["port"]),
+            "source": "config",
+        }
+    adb_device = get_adb_device(serial)
+    if not adb_device:
+        return {}
+    return infer_uhubctl_target_from_usb_path(adb_device.usb_path)
 
 
 def adb_state_for_serial(serial: str) -> str:
@@ -460,6 +524,13 @@ def enrich_adb_with_usb(adb_devices: list[AdbDevice], usb_devices: list[UsbDevic
             return_hint = "unlock phone and accept USB debugging authorization"
         elif row["state"] == "offline":
             return_hint = "ADB session is offline; reconnect can restart the ADB transport"
+        inferred_uhubctl = infer_uhubctl_target_from_usb_path(device.usb_path)
+        row["uhubctl_target"] = inferred_uhubctl
+        if inferred_uhubctl:
+            row["hub_evidence"] = [
+                *row["hub_evidence"],
+                f"inferred uhubctl target: -l {inferred_uhubctl['location']} -p {inferred_uhubctl['port']}",
+            ]
         row["status_hint"] = return_hint
         enriched.append(row)
     return enriched
@@ -496,7 +567,7 @@ def recovery_plan_for_serial(serial: str, config: dict[str, Any]) -> list[str]:
 
 
 def power_cycle_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
-    uhubctl = device_config.get("uhubctl", {})
+    uhubctl = device_config.get("uhubctl", device_config)
     if not uhubctl.get("location") or not uhubctl.get("port"):
         return record_action("power-cycle", False, "missing uhubctl location or port in config", serial)
     if not shutil.which("uhubctl"):
@@ -516,7 +587,7 @@ def power_cycle_linux_hub_port(serial: str, device_config: dict[str, Any]) -> di
 
 
 def power_off_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
-    uhubctl = device_config.get("uhubctl", {})
+    uhubctl = device_config.get("uhubctl", device_config)
     if not uhubctl.get("location") or not uhubctl.get("port"):
         return record_action("hub-port-off", False, "missing uhubctl location or port in config", serial)
     if not shutil.which("uhubctl"):
@@ -554,12 +625,15 @@ def recover_device(serial: str = "", reason: str = "manual", allow_power_cycle: 
     messages.append(first["message"])
 
     system = platform.system().lower()
-    if allow_power_cycle and serial and device_config:
-        if system == "linux" and device_config.get("uhubctl"):
-            result = power_cycle_linux_hub_port(serial, device_config)
-            messages.append(result["message"])
-            time.sleep(2)
-            messages.append(reconnect_device(serial)["message"])
+    if allow_power_cycle and serial:
+        if system == "linux":
+            uhubctl_target = uhubctl_target_for_serial(serial, config)
+            if uhubctl_target:
+                result = power_cycle_linux_hub_port(serial, uhubctl_target)
+                messages.append(f"uhubctl source={uhubctl_target.get('source', '-')}")
+                messages.append(result["message"])
+                time.sleep(2)
+                messages.append(reconnect_device(serial)["message"])
         elif system == "windows" and device_config.get("windows_instance_id"):
             result = restart_windows_usb_device(serial, device_config)
             messages.append(result["message"])
@@ -575,17 +649,25 @@ def disconnect_device(serial: str) -> dict[str, Any]:
     MANUAL_DISCONNECT_UNTIL[serial] = time.time() + 120
 
     config = load_config()
-    device_config = configured_devices(config).get(serial, {})
-    if platform.system().lower() == "linux" and device_config.get("uhubctl"):
-        result = power_off_linux_hub_port(serial, device_config)
-        verified, last_state = wait_for_adb_absent(serial)
-        return record_action(
-            "disconnect",
-            result["ok"] and verified,
-            f"hub port power off requested; adb verification={'absent' if verified else 'still ' + last_state}; {result['message']}",
+    if platform.system().lower() == "linux":
+        uhubctl_target = uhubctl_target_for_serial(serial, config)
+        if uhubctl_target:
+            result = power_off_linux_hub_port(serial, uhubctl_target)
+            verified, last_state = wait_for_adb_absent(serial)
+            return record_action(
+                "disconnect",
+                result["ok"] and verified,
+                "hub port power off requested "
+                f"via {uhubctl_target.get('source', '-')}; adb verification="
+                f"{'absent' if verified else 'still ' + last_state}; {result['message']}",
+                serial,
+            )
+        record_action(
+            "disconnect-info",
+            False,
+            "no uhubctl target could be inferred or configured; falling back to Android-side USB data command",
             serial,
         )
-
     if not shutil.which("adb"):
         return record_action("disconnect", False, "adb is not installed or not on PATH", serial)
     command = ["adb", "-s", serial, "shell", "svc", "usb", "setFunctions", "none"]
@@ -683,7 +765,8 @@ def snapshot() -> dict[str, Any]:
         "auto_reconnect_enabled": AUTO_RECONNECT_ENABLED,
         "config_path": CONFIG_PATH,
         "configured_device_count": len(configured_devices(config)),
-        "last_actions": LAST_ACTIONS,
+        "active_actions": active_actions_snapshot(),
+        "last_actions": last_actions_snapshot(),
         "summary": {
             "total_usb_devices": len(usb_devices),
             "hubs": sum(1 for device in usb_devices if device.is_hub),
@@ -771,30 +854,45 @@ INDEX_HTML = """<!doctype html>
   <style>
     :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; background: #f4f6f7; color: #162027; }
-    header { padding: 16px 22px; background: #ffffff; border-bottom: 1px solid #d9e0e5; }
+    header { padding: 16px 22px; background: #ffffff; border-bottom: 1px solid #d9e0e5; position: sticky; top: 0; z-index: 2; }
     h1 { margin: 0; font-size: 20px; }
     main { padding: 18px 22px; max-width: 1180px; margin: 0 auto; }
-    button { border: 1px solid #b9c4cc; background: #ffffff; color: inherit; border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+    button { border: 1px solid #b9c4cc; background: #ffffff; color: inherit; border-radius: 6px; padding: 7px 10px; cursor: pointer; transition: transform .08s ease, background .12s ease, opacity .12s ease; }
     button:hover { background: #eef3f5; }
-    .danger { border-color: #cc9d9d; }
+    button:active { transform: translateY(1px); }
+    button:disabled { cursor: wait; opacity: .55; }
+    .danger { border-color: #cc9d9d; color: #8f2525; }
+    .primary { border-color: #7ea3c7; color: #164f7d; }
     .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 14px; }
     .stat, .device, .notice { background: #ffffff; border: 1px solid #d9e0e5; border-radius: 8px; padding: 13px; }
     .stat b { display: block; font-size: 24px; margin-top: 3px; }
+    .stat.good b { color: #16834a; }
+    .stat.bad b { color: #b54531; }
     .section-title { margin: 20px 0 9px; font-size: 16px; }
     .devices { display: grid; gap: 10px; }
     .device.ready { border-left: 5px solid #16834a; }
     .device.warn { border-left: 5px solid #c47a21; }
+    .device.failed { border-left: 5px solid #b54531; }
+    .device.running { border-left: 5px solid #2b76b7; animation: pulseBorder 1.2s ease-in-out infinite; }
     .device.hub { border-left: 5px solid #5b6b7a; }
     .name { font-weight: 700; margin-bottom: 7px; }
     .meta { color: #53616d; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
     .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #e8eef1; margin-left: 8px; font-size: 12px; }
+    .tag.ok { background: #dff2e7; color: #11633a; }
+    .tag.failed { background: #f7ded9; color: #8f2525; }
+    .tag.running { background: #dcecff; color: #164f7d; }
+    .hint { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #eef5fb; color: #244b68; font-size: 13px; }
+    .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; margin-right: 6px; vertical-align: -1px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes pulseBorder { 0%, 100% { box-shadow: 0 0 0 rgba(43, 118, 183, 0); } 50% { box-shadow: 0 0 0 3px rgba(43, 118, 183, .16); } }
     @media (prefers-color-scheme: dark) {
       body { background: #101519; color: #e7ecef; }
       header, .stat, .device, .notice, button { background: #171d22; border-color: #2c363f; }
       button:hover { background: #202932; }
       .meta { color: #a8b3bc; }
       .tag { background: #28323a; }
+      .hint { background: #1d2b35; color: #bdd6e8; }
     }
   </style>
 </head>
@@ -803,6 +901,8 @@ INDEX_HTML = """<!doctype html>
   <main>
     <section class="stats" id="stats"></section>
     <section class="notice" id="notice"></section>
+    <h2 class="section-title">Running Actions</h2>
+    <section class="devices" id="active"></section>
     <h2 class="section-title">Android Devices</h2>
     <section class="devices" id="android"></section>
     <h2 class="section-title">Configured Devices Missing From ADB</h2>
@@ -820,12 +920,14 @@ INDEX_HTML = """<!doctype html>
     const updatedEl = document.querySelector("#updated");
     const noticeEl = document.querySelector("#notice");
     const actionsEl = document.querySelector("#actions");
+    const activeEl = document.querySelector("#active");
 
     function stat(label, value) {
       return `<div class="stat"><span>${label}</span><b>${value}</b></div>`;
     }
 
     async function doAction(action, serial = "") {
+      markButtonBusy(action, serial);
       const response = await fetch("/api/action", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -838,32 +940,52 @@ INDEX_HTML = """<!doctype html>
       refreshLater(6500);
     }
 
-    function androidCard(device) {
-      const cls = device.needs_attention ? "warn" : "ready";
+    function markButtonBusy(action, serial) {
+      const selector = `button[data-action="${action}"][data-serial="${serial}"]`;
+      document.querySelectorAll(selector).forEach((button) => {
+        button.disabled = true;
+        button.innerHTML = `<span class="spinner"></span>${button.textContent}`;
+      });
+    }
+
+    function isSerialActive(state, serial) {
+      return state.active_actions.some((action) => action.serial === serial);
+    }
+
+    function androidCard(device, state) {
+      const active = isSerialActive(state, device.serial);
+      const cls = active ? "running" : device.needs_attention ? "warn" : "ready";
       const hub = device.behind_hub ? "Behind hub" : "Hub unknown";
       const evidence = device.hub_evidence.length ? `<div class="meta">Hub evidence: ${device.hub_evidence.join("; ")}</div>` : "";
+      const hubControl = device.uhubctl_target && device.uhubctl_target.location
+        ? `<div class="hint">Hub control target: uhubctl -l ${device.uhubctl_target.location} -p ${device.uhubctl_target.port} (${device.uhubctl_target.source})</div>`
+        : `<div class="hint">No controllable Hub port inferred yet. Disconnect will fall back to Android-side USB data disable.</div>`;
+      const disabled = active ? "disabled" : "";
       return `<article class="device ${cls}">
         <div class="name">${device.serial}<span class="tag">${device.state}</span><span class="tag">${hub}</span></div>
         <div class="meta">Model: ${device.model || "-"} · Product: ${device.product || "-"} · Device: ${device.device || "-"}</div>
         <div class="meta">ADB USB path: ${device.usb_path || "-"} · Transport: ${device.transport_id || "-"}</div>
         <div class="meta">${device.status_hint}</div>
         ${evidence}
+        ${hubControl}
         <div class="actions">
-          <button onclick="doAction('reconnect', '${device.serial}')">Reconnect</button>
-          <button onclick="doAction('recover', '${device.serial}')">Recover</button>
-          <button onclick="doAction('verify', '${device.serial}')">Verify</button>
-          <button class="danger" onclick="doAction('disconnect', '${device.serial}')">Disconnect and verify</button>
+          <button class="primary" data-action="reconnect" data-serial="${device.serial}" ${disabled} onclick="doAction('reconnect', '${device.serial}')">Reconnect</button>
+          <button data-action="recover" data-serial="${device.serial}" ${disabled} onclick="doAction('recover', '${device.serial}')">Recover</button>
+          <button data-action="verify" data-serial="${device.serial}" ${disabled} onclick="doAction('verify', '${device.serial}')">Verify</button>
+          <button class="danger" data-action="disconnect" data-serial="${device.serial}" ${disabled} onclick="doAction('disconnect', '${device.serial}')">Disconnect and verify</button>
         </div>
       </article>`;
     }
 
-    function missingCard(device) {
+    function missingCard(device, state) {
+      const active = isSerialActive(state, device.serial);
+      const disabled = active ? "disabled" : "";
       return `<article class="device warn">
         <div class="name">${device.name}<span class="tag">${device.serial}</span></div>
         <div class="meta">Recovery plan: ${device.recovery_plan.join(" -> ")}</div>
         <div class="actions">
-          <button onclick="doAction('verify', '${device.serial}')">Verify</button>
-          <button onclick="doAction('recover', '${device.serial}')">Recover</button>
+          <button data-action="verify" data-serial="${device.serial}" ${disabled} onclick="doAction('verify', '${device.serial}')">Verify</button>
+          <button class="primary" data-action="recover" data-serial="${device.serial}" ${disabled} onclick="doAction('recover', '${device.serial}')">Recover</button>
         </div>
       </article>`;
     }
@@ -881,8 +1003,19 @@ INDEX_HTML = """<!doctype html>
     }
 
     function actionCard(action) {
-      return `<article class="device ${action.ok ? "ready" : "warn"}">
-        <div class="name">${action.action}<span class="tag">${action.ok ? "ok" : "failed"}</span></div>
+      const status = action.status || (action.ok ? "ok" : "failed");
+      const cls = status === "running" ? "running" : action.ok ? "ready" : "failed";
+      const spinner = status === "running" ? `<span class="spinner"></span>` : "";
+      return `<article class="device ${cls}">
+        <div class="name">${spinner}${action.action}<span class="tag ${status}">${status}</span></div>
+        <div class="meta">${action.timestamp} · ${action.serial || "all devices"}</div>
+        <div class="meta">${action.message}</div>
+      </article>`;
+    }
+
+    function activeCard(action) {
+      return `<article class="device running">
+        <div class="name"><span class="spinner"></span>${action.action}<span class="tag running">running</span></div>
         <div class="meta">${action.timestamp} · ${action.serial || "all devices"}</div>
         <div class="meta">${action.message}</div>
       </article>`;
@@ -896,17 +1029,20 @@ INDEX_HTML = """<!doctype html>
         ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Configured devices: ${state.configured_device_count}. Config file: ${state.config_path}.`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       statsEl.innerHTML = [
-        stat("ADB Android", state.summary.adb_android_devices),
+        `<div class="stat ${state.summary.adb_android_devices ? "good" : "bad"}"><span>ADB Android</span><b>${state.summary.adb_android_devices}</b></div>`,
         stat("Behind hub", state.summary.android_behind_hub),
         stat("Configured missing", state.summary.configured_missing),
         stat("Needs attention", state.summary.attention),
         stat("USB hubs", state.summary.hubs)
       ].join("");
+      activeEl.innerHTML = state.active_actions.length
+        ? state.active_actions.map(activeCard).join("")
+        : `<article class="device ready"><div class="name">No actions running</div></article>`;
       androidEl.innerHTML = state.android_devices.length
-        ? state.android_devices.map(androidCard).join("")
+        ? state.android_devices.map((device) => androidCard(device, state)).join("")
         : `<article class="device"><div class="name">No ADB Android devices detected</div><div class="meta">Connect the phone by USB, enable USB debugging, and authorize this computer.</div><div class="actions"><button onclick="doAction('reconnect')">Restart ADB discovery</button></div></article>`;
       missingEl.innerHTML = state.missing_configured_devices.length
-        ? state.missing_configured_devices.map(missingCard).join("")
+        ? state.missing_configured_devices.map((device) => missingCard(device, state)).join("")
         : `<article class="device ready"><div class="name">No configured devices are missing</div></article>`;
       usbEl.innerHTML = state.usb_devices.length
         ? state.usb_devices.map(usbCard).join("")

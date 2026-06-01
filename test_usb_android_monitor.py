@@ -4,6 +4,7 @@ from usb_android_monitor import (
     configured_devices,
     flatten_usb_tree,
     hub_evidence_from_adb_usb_path,
+    infer_uhubctl_target_from_usb_path,
     parse_adb_devices,
     recovery_plan_for_serial,
 )
@@ -80,6 +81,16 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
 
     def test_plain_linux_usb_path_is_not_enough_for_hub(self) -> None:
         self.assertEqual(hub_evidence_from_adb_usb_path("1-1"), [])
+
+    def test_infers_uhubctl_target_from_linux_usb_path(self) -> None:
+        self.assertEqual(
+            infer_uhubctl_target_from_usb_path("1-2.2"),
+            {"location": "1-2", "port": "2", "source": "adb usb path 1-2.2"},
+        )
+        self.assertEqual(
+            infer_uhubctl_target_from_usb_path("2-2.3"),
+            {"location": "2-2", "port": "3", "source": "adb usb path 2-2.3"},
+        )
 
     def test_recovery_plan_includes_configured_hub_port(self) -> None:
         config = {

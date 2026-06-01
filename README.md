@@ -101,6 +101,9 @@ Open the dashboard at <http://127.0.0.1:8765> after running `serve`.
 
 ## Notes
 
+- Dashboard actions are asynchronous. A `*-queued` entry means the request was accepted; the
+  final `disconnect`, `recover`, `reconnect`, or `verify` entry appears when the background check
+  completes.
 - If the USB cable or hub is physically disconnected, software cannot force the device back.
   It can only restart ADB discovery, reset the operating system's USB device, or power-cycle a
   supported Hub port.

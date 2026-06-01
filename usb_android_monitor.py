@@ -108,6 +108,21 @@ def record_action(action: str, ok: bool, message: str, serial: str = "") -> dict
     return entry
 
 
+def run_action_async(action: str, serial: str) -> dict[str, Any]:
+    action_map = {
+        "reconnect": reconnect_device,
+        "recover": recover_device,
+        "verify": verify_device,
+        "disconnect": disconnect_device,
+    }
+    target = action_map.get(action)
+    if target is None:
+        return record_action(action or "unknown", False, "unsupported action", serial)
+    queued = record_action(f"{action}-queued", True, "action queued; final result will appear shortly", serial)
+    threading.Thread(target=target, args=(serial,), daemon=True).start()
+    return queued
+
+
 def run_command(args: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
 
@@ -943,16 +958,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         action = payload.get("action", "")
         serial = payload.get("serial", "")
-        if action == "reconnect":
-            result = reconnect_device(serial)
-        elif action == "recover":
-            result = recover_device(serial)
-        elif action == "verify":
-            result = verify_device(serial)
-        elif action == "disconnect":
-            result = disconnect_device(serial)
-        else:
-            result = record_action(action or "unknown", False, "unsupported action", serial)
+        result = run_action_async(action, serial)
         body = json.dumps(result, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")

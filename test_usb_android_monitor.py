@@ -1,12 +1,15 @@
 import unittest
 from unittest.mock import patch
 
+import usb_android_monitor
 from usb_android_monitor import (
     configured_devices,
     flatten_usb_tree,
     hub_evidence_from_adb_usb_path,
     infer_uhubctl_target_from_usb_path,
+    last_actions_snapshot,
     parse_adb_devices,
+    record_adb_device_events,
     recovery_plan_for_serial,
     snapshot,
     wait_for_adb_present,
@@ -14,6 +17,13 @@ from usb_android_monitor import (
 
 
 class UsbAndroidMonitorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with usb_android_monitor.ACTION_LOCK:
+            usb_android_monitor.LAST_ACTIONS.clear()
+            usb_android_monitor.ACTIVE_ACTIONS.clear()
+            usb_android_monitor.ADB_EVENT_STATE.clear()
+            usb_android_monitor.ADB_EVENT_LOG_INITIALIZED = False
+
     def test_detects_android_phone_behind_hub(self) -> None:
         state = {
             "SPUSBDataType": [
@@ -151,6 +161,30 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
 
         self.assertTrue(present)
         self.assertEqual(state, "device")
+
+    def test_adb_event_log_records_disconnect_and_reconnect(self) -> None:
+        online = [
+            {
+                "serial": "SERIAL1",
+                "state": "device",
+                "usb_path": "2-2.3",
+                "transport_id": "7",
+                "behind_hub": True,
+            }
+        ]
+
+        record_adb_device_events(online)
+        self.assertEqual(last_actions_snapshot(), [])
+
+        record_adb_device_events([])
+        actions = last_actions_snapshot()
+        self.assertEqual(actions[0]["action"], "device-disconnected")
+        self.assertEqual(actions[0]["serial"], "SERIAL1")
+
+        record_adb_device_events(online)
+        actions = last_actions_snapshot()
+        self.assertEqual(actions[0]["action"], "device-connected")
+        self.assertEqual(actions[0]["serial"], "SERIAL1")
 
 
 if __name__ == "__main__":

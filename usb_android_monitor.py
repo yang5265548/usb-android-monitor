@@ -59,6 +59,8 @@ HUB_TEXT_MARKERS = ("hub", "multiport", "dock", "adapter")
 LAST_ACTIONS: list[dict[str, Any]] = []
 ACTIVE_ACTIONS: dict[str, dict[str, Any]] = {}
 ACTION_LOCK = threading.Lock()
+ADB_EVENT_STATE: dict[str, tuple[str, str, str, bool]] = {}
+ADB_EVENT_LOG_INITIALIZED = False
 AUTO_RECONNECT_ENABLED = True
 AUTO_RECONNECT_ATTEMPTS: dict[str, float] = {}
 MANUAL_DISCONNECT_UNTIL: dict[str, float] = {}
@@ -173,6 +175,66 @@ def active_actions_snapshot() -> list[dict[str, Any]]:
 def last_actions_snapshot() -> list[dict[str, Any]]:
     with ACTION_LOCK:
         return list(LAST_ACTIONS)
+
+
+def adb_event_signature(device: dict[str, Any]) -> tuple[str, str, str, bool]:
+    return (
+        str(device.get("state") or ""),
+        str(device.get("usb_path") or ""),
+        str(device.get("transport_id") or ""),
+        bool(device.get("behind_hub")),
+    )
+
+
+def record_adb_device_events(devices: list[dict[str, Any]]) -> None:
+    global ADB_EVENT_LOG_INITIALIZED
+
+    current = {str(device["serial"]): adb_event_signature(device) for device in devices if device.get("serial")}
+    events: list[tuple[str, str, str, str]] = []
+    with ACTION_LOCK:
+        previous = dict(ADB_EVENT_STATE)
+        if not ADB_EVENT_LOG_INITIALIZED:
+            ADB_EVENT_STATE.clear()
+            ADB_EVENT_STATE.update(current)
+            ADB_EVENT_LOG_INITIALIZED = True
+            return
+        for serial, signature in current.items():
+            if serial not in previous:
+                events.append(
+                    (
+                        "device-connected",
+                        serial,
+                        "event",
+                        f"ADB device appeared: state={signature[0]}, usb={signature[1] or '-'}",
+                    )
+                )
+            elif previous[serial] != signature:
+                events.append(
+                    (
+                        "device-changed",
+                        serial,
+                        "event",
+                        "ADB device changed: "
+                        f"state {previous[serial][0]} -> {signature[0]}, "
+                        f"usb {previous[serial][1] or '-'} -> {signature[1] or '-'}, "
+                        f"transport {previous[serial][2] or '-'} -> {signature[2] or '-'}",
+                    )
+                )
+        for serial, signature in previous.items():
+            if serial not in current:
+                events.append(
+                    (
+                        "device-disconnected",
+                        serial,
+                        "event",
+                        f"ADB device disappeared: last state={signature[0]}, usb={signature[1] or '-'}",
+                    )
+                )
+        ADB_EVENT_STATE.clear()
+        ADB_EVENT_STATE.update(current)
+
+    for action, serial, status, message in events:
+        record_action(action, True, message, serial, status=status)
 
 
 def dashboard_diagnostics() -> list[dict[str, str]]:
@@ -985,6 +1047,7 @@ def snapshot() -> dict[str, Any]:
     usb_devices, usb_backend = get_usb_devices()
     adb_devices = get_adb_devices()
     android_devices = enrich_adb_with_usb(adb_devices, usb_devices)
+    record_adb_device_events(android_devices)
     auto_reconnect_if_needed(android_devices, config)
     usb_android = [device for device in usb_devices if device.is_android_candidate]
     current_serials = {device["serial"] for device in android_devices}
@@ -1174,6 +1237,7 @@ INDEX_HTML = """<!doctype html>
     .tag.ok { background: #193b2a; color: #9df0bf; }
     .tag.failed { background: #4a211d; color: #ffc0b8; }
     .tag.running { background: #173653; color: #bfe1ff; }
+    .tag.event { background: #26323b; color: #c8d5df; }
     .hint { margin-top: 8px; padding: 9px 10px; border-radius: 6px; background: #102638; color: #bfe1ff; font-size: 13px; border: 1px solid #24445d; }
     .diag { border-left: 5px solid #e05242; margin-bottom: 10px; }
     .diag-title { font-weight: 700; margin-bottom: 4px; }

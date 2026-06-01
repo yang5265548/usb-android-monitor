@@ -122,6 +122,17 @@ def run_action_async(action: str, serial: str) -> dict[str, Any]:
     target = action_map.get(action)
     if target is None:
         return record_action(action or "unknown", False, "unsupported action", serial)
+    with ACTION_LOCK:
+        for active in ACTIVE_ACTIONS.values():
+            if active["serial"] == serial:
+                return {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "action": action,
+                    "serial": serial,
+                    "ok": True,
+                    "status": "running",
+                    "message": f"{active['action']} is already running for this device",
+                }
     action_id = f"{action}:{serial or 'all'}:{time.time()}"
     started = {
         "id": action_id,
@@ -132,7 +143,6 @@ def run_action_async(action: str, serial: str) -> dict[str, Any]:
     }
     with ACTION_LOCK:
         ACTIVE_ACTIONS[action_id] = started
-    queued = record_action(f"{action}-queued", True, "action queued; final result will appear shortly", serial, "running")
 
     def worker() -> None:
         try:
@@ -142,7 +152,14 @@ def run_action_async(action: str, serial: str) -> dict[str, Any]:
                 ACTIVE_ACTIONS.pop(action_id, None)
 
     threading.Thread(target=worker, daemon=True).start()
-    return queued
+    return {
+        "timestamp": started["timestamp"],
+        "action": action,
+        "serial": serial,
+        "ok": True,
+        "status": "running",
+        "message": "action started; final result will appear in recent actions",
+    }
 
 
 def active_actions_snapshot() -> list[dict[str, Any]]:
@@ -153,6 +170,35 @@ def active_actions_snapshot() -> list[dict[str, Any]]:
 def last_actions_snapshot() -> list[dict[str, Any]]:
     with ACTION_LOCK:
         return list(LAST_ACTIONS)
+
+
+def dashboard_diagnostics() -> list[dict[str, str]]:
+    diagnostics: list[dict[str, str]] = []
+    with ACTION_LOCK:
+        recent = list(LAST_ACTIONS[:8])
+    for action in recent:
+        message = action.get("message", "")
+        if "USB permission problem" in message:
+            diagnostics.append(
+                {
+                    "level": "error",
+                    "title": "USB permission is blocking hub control",
+                    "message": "Start the service with sudo for a quick test, or add udev rules for uhubctl/libusb.",
+                }
+            )
+            break
+    for action in recent:
+        message = action.get("message", "")
+        if "No controllable hub was found" in message:
+            diagnostics.append(
+                {
+                    "level": "error",
+                    "title": "Inferred hub location is not controllable",
+                    "message": "Run `sudo uhubctl` and compare the listed locations with the location shown on each phone card.",
+                }
+            )
+            break
+    return diagnostics
 
 
 def run_command(args: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
@@ -351,6 +397,24 @@ def uhubctl_target_for_serial(serial: str, config: dict[str, Any]) -> dict[str, 
     if not adb_device:
         return {}
     return infer_uhubctl_target_from_usb_path(adb_device.usb_path)
+
+
+def explain_uhubctl_failure(output: str, target: dict[str, Any]) -> str:
+    lower = output.lower()
+    location = target.get("location", "-")
+    if "permission" in lower or "accessing usb" in lower:
+        return (
+            "USB permission problem. Run the service with sudo for testing, or install udev rules "
+            "for uhubctl/libusb access. "
+        )
+    if "no compatible devices" in lower:
+        return (
+            f"No controllable hub was found at location {location}. Run `sudo uhubctl` and use one "
+            "of the exact locations it lists, or use a hub with per-port power switching. "
+        )
+    if "not found" in lower:
+        return "uhubctl could not find the requested hub or port. Verify the inferred location/port. "
+    return ""
 
 
 def adb_state_for_serial(serial: str) -> str:
@@ -583,7 +647,9 @@ def power_cycle_linux_hub_port(serial: str, device_config: dict[str, Any]) -> di
     ]
     result = run_command(command, timeout=20)
     output = (result.stdout + result.stderr).strip()
-    return record_action("power-cycle", result.returncode == 0, output or str(result.returncode), serial)
+    diagnostic = explain_uhubctl_failure(output, uhubctl)
+    message = f"{diagnostic}{output or result.returncode}"
+    return record_action("power-cycle", result.returncode == 0, message, serial)
 
 
 def power_off_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
@@ -603,7 +669,9 @@ def power_off_linux_hub_port(serial: str, device_config: dict[str, Any]) -> dict
     ]
     result = run_command(command, timeout=20)
     output = (result.stdout + result.stderr).strip()
-    return record_action("hub-port-off", result.returncode == 0, output or str(result.returncode), serial)
+    diagnostic = explain_uhubctl_failure(output, uhubctl)
+    message = f"{diagnostic}{output or result.returncode}"
+    return record_action("hub-port-off", result.returncode == 0, message, serial)
 
 
 def restart_windows_usb_device(serial: str, device_config: dict[str, Any]) -> dict[str, Any]:
@@ -767,6 +835,7 @@ def snapshot() -> dict[str, Any]:
         "configured_device_count": len(configured_devices(config)),
         "active_actions": active_actions_snapshot(),
         "last_actions": last_actions_snapshot(),
+        "diagnostics": dashboard_diagnostics(),
         "summary": {
             "total_usb_devices": len(usb_devices),
             "hubs": sum(1 for device in usb_devices if device.is_hub),
@@ -850,67 +919,70 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>USB Android Monitor</title>
+  <title>Android USB Device Pool</title>
   <style>
-    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; background: #f4f6f7; color: #162027; }
-    header { padding: 16px 22px; background: #ffffff; border-bottom: 1px solid #d9e0e5; position: sticky; top: 0; z-index: 2; }
-    h1 { margin: 0; font-size: 20px; }
-    main { padding: 18px 22px; max-width: 1180px; margin: 0 auto; }
-    button { border: 1px solid #b9c4cc; background: #ffffff; color: inherit; border-radius: 6px; padding: 7px 10px; cursor: pointer; transition: transform .08s ease, background .12s ease, opacity .12s ease; }
-    button:hover { background: #eef3f5; }
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #0f1419; color: #e8edf2; }
+    header { padding: 18px 24px; background: #131a21; border-bottom: 1px solid #26323d; position: sticky; top: 0; z-index: 2; box-shadow: 0 8px 30px rgba(0,0,0,.18); }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0; }
+    main { padding: 20px 24px 36px; max-width: 1280px; margin: 0 auto; }
+    button { border: 1px solid #344554; background: #18222c; color: #e8edf2; border-radius: 6px; padding: 7px 10px; cursor: pointer; transition: transform .08s ease, background .12s ease, opacity .12s ease, border-color .12s ease; }
+    button:hover { background: #22303c; border-color: #4b6377; }
     button:active { transform: translateY(1px); }
     button:disabled { cursor: wait; opacity: .55; }
-    .danger { border-color: #cc9d9d; color: #8f2525; }
-    .primary { border-color: #7ea3c7; color: #164f7d; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-bottom: 14px; }
-    .stat, .device, .notice { background: #ffffff; border: 1px solid #d9e0e5; border-radius: 8px; padding: 13px; }
+    .danger { border-color: #8b463e; color: #ffb8ad; }
+    .primary { border-color: #3c78aa; color: #bfe1ff; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .stat, .device, .notice, .diag { background: #151d24; border: 1px solid #2a3742; border-radius: 8px; padding: 14px; }
     .stat b { display: block; font-size: 24px; margin-top: 3px; }
-    .stat.good b { color: #16834a; }
-    .stat.bad b { color: #b54531; }
+    .stat.good b { color: #44d184; }
+    .stat.bad b { color: #ff806f; }
     .section-title { margin: 20px 0 9px; font-size: 16px; }
     .devices { display: grid; gap: 10px; }
-    .device.ready { border-left: 5px solid #16834a; }
-    .device.warn { border-left: 5px solid #c47a21; }
-    .device.failed { border-left: 5px solid #b54531; }
-    .device.running { border-left: 5px solid #2b76b7; animation: pulseBorder 1.2s ease-in-out infinite; }
-    .device.hub { border-left: 5px solid #5b6b7a; }
+    .device.ready { border-left: 5px solid #2fbf72; }
+    .device.warn { border-left: 5px solid #d99432; }
+    .device.failed { border-left: 5px solid #e05242; }
+    .device.running { border-left: 5px solid #4da3ff; animation: pulseBorder 1.2s ease-in-out infinite; }
+    .device.hub { border-left: 5px solid #7b8a96; }
     .name { font-weight: 700; margin-bottom: 7px; }
-    .meta { color: #53616d; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+    .meta { color: #b6c3cf; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-    .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #e8eef1; margin-left: 8px; font-size: 12px; }
-    .tag.ok { background: #dff2e7; color: #11633a; }
-    .tag.failed { background: #f7ded9; color: #8f2525; }
-    .tag.running { background: #dcecff; color: #164f7d; }
-    .hint { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: #eef5fb; color: #244b68; font-size: 13px; }
+    .tag { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #25313b; color: #d7e0e8; margin-left: 8px; font-size: 12px; }
+    .tag.ok { background: #193b2a; color: #9df0bf; }
+    .tag.failed { background: #4a211d; color: #ffc0b8; }
+    .tag.running { background: #173653; color: #bfe1ff; }
+    .hint { margin-top: 8px; padding: 9px 10px; border-radius: 6px; background: #102638; color: #bfe1ff; font-size: 13px; border: 1px solid #24445d; }
+    .diag { border-left: 5px solid #e05242; margin-bottom: 10px; }
+    .diag-title { font-weight: 700; margin-bottom: 4px; }
+    .columns { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(360px, .75fr); gap: 16px; align-items: start; }
+    @media (max-width: 980px) { .columns { grid-template-columns: 1fr; } }
     .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; margin-right: 6px; vertical-align: -1px; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @keyframes pulseBorder { 0%, 100% { box-shadow: 0 0 0 rgba(43, 118, 183, 0); } 50% { box-shadow: 0 0 0 3px rgba(43, 118, 183, .16); } }
-    @media (prefers-color-scheme: dark) {
-      body { background: #101519; color: #e7ecef; }
-      header, .stat, .device, .notice, button { background: #171d22; border-color: #2c363f; }
-      button:hover { background: #202932; }
-      .meta { color: #a8b3bc; }
-      .tag { background: #28323a; }
-      .hint { background: #1d2b35; color: #bdd6e8; }
-    }
   </style>
 </head>
 <body>
-  <header><h1>USB Android Monitor</h1><div id="updated" class="meta"></div></header>
+  <header><h1>Android USB Device Pool</h1><div id="updated" class="meta"></div></header>
   <main>
     <section class="stats" id="stats"></section>
     <section class="notice" id="notice"></section>
-    <h2 class="section-title">Running Actions</h2>
-    <section class="devices" id="active"></section>
-    <h2 class="section-title">Android Devices</h2>
-    <section class="devices" id="android"></section>
-    <h2 class="section-title">Configured Devices Missing From ADB</h2>
-    <section class="devices" id="missing"></section>
-    <h2 class="section-title">USB / Hub Context</h2>
-    <section class="devices" id="usb"></section>
-    <h2 class="section-title">Recent Actions</h2>
-    <section class="devices" id="actions"></section>
+    <section id="diagnostics"></section>
+    <div class="columns">
+      <section>
+        <h2 class="section-title">Android Devices</h2>
+        <section class="devices" id="android"></section>
+        <h2 class="section-title">Configured Devices Missing From ADB</h2>
+        <section class="devices" id="missing"></section>
+        <h2 class="section-title">USB / Hub Context</h2>
+        <section class="devices" id="usb"></section>
+      </section>
+      <section>
+        <h2 class="section-title">Running Actions</h2>
+        <section class="devices" id="active"></section>
+        <h2 class="section-title">Recent Actions</h2>
+        <section class="devices" id="actions"></section>
+      </section>
+    </div>
   </main>
   <script>
     const statsEl = document.querySelector("#stats");
@@ -921,6 +993,7 @@ INDEX_HTML = """<!doctype html>
     const noticeEl = document.querySelector("#notice");
     const actionsEl = document.querySelector("#actions");
     const activeEl = document.querySelector("#active");
+    const diagnosticsEl = document.querySelector("#diagnostics");
 
     function stat(label, value) {
       return `<div class="stat"><span>${label}</span><b>${value}</b></div>`;
@@ -1021,6 +1094,13 @@ INDEX_HTML = """<!doctype html>
       </article>`;
     }
 
+    function diagnosticCard(item) {
+      return `<article class="diag">
+        <div class="diag-title">${item.title}</div>
+        <div class="meta">${item.message}</div>
+      </article>`;
+    }
+
     async function refresh() {
       const response = await fetch("/api/state");
       const state = await response.json();
@@ -1028,6 +1108,9 @@ INDEX_HTML = """<!doctype html>
       noticeEl.innerHTML = state.adb_available
         ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Configured devices: ${state.configured_device_count}. Config file: ${state.config_path}.`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
+      diagnosticsEl.innerHTML = state.diagnostics.length
+        ? state.diagnostics.map(diagnosticCard).join("")
+        : "";
       statsEl.innerHTML = [
         `<div class="stat ${state.summary.adb_android_devices ? "good" : "bad"}"><span>ADB Android</span><b>${state.summary.adb_android_devices}</b></div>`,
         stat("Behind hub", state.summary.android_behind_hub),

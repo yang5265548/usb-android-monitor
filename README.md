@@ -49,6 +49,11 @@ On Linux, the app can infer a likely `uhubctl` target from ADB USB paths. For ex
 If the Hub supports per-port power switching, `Disconnect and verify` uses that target before
 falling back to the less reliable Android-side USB data command.
 
+If the dashboard reports `USB permission problem`, first test by running the server with `sudo`.
+If it reports `No controllable hub was found`, run `sudo uhubctl` and check whether locations
+such as `1-2` or `2-2` are listed. If they are not listed, the current Hub is visible in USB
+topology but cannot be power-cycled by `uhubctl`.
+
 Copy the example config and fill in your real device serials:
 
 ```sh

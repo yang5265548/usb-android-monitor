@@ -9,6 +9,7 @@ from usb_android_monitor import (
     acroname_mapping_control,
     clear_learned_acroname_mappings,
     configured_devices,
+    connect_device,
     diagnose_disconnect,
     disconnect_device,
     format_text_log,
@@ -473,6 +474,56 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertFalse(result["ok"])
         self.assertIn("Refresh Acroname port map", result["message"])
         self.assertNotIn("setFunctions", result["message"])
+
+    def test_acroname_connect_uses_global_discovery_when_serial_reconnect_is_slow(self) -> None:
+        control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.acroname_control_for_serial", return_value=control),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                return_value={"ok": True, "status": "ok", "message": "Acroname USBHub3c port 5 on; result=0"},
+            ),
+            patch(
+                "usb_android_monitor.reconnect_device",
+                side_effect=[
+                    {"ok": True, "message": "serial reconnect did not find device"},
+                    {"ok": True, "message": "global reconnect"},
+                ],
+            ) as reconnect,
+            patch("usb_android_monitor.wait_for_adb_present", side_effect=[(False, "absent"), (True, "device")]),
+            patch("usb_android_monitor.forget_disconnected_target") as forget,
+        ):
+            result = connect_device("SERIAL1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(reconnect.call_args_list[1].args[0], "")
+        self.assertIn("adb returned after global discovery", result["message"])
+        forget.assert_called_once_with("SERIAL1")
+
+    def test_acroname_connect_cycles_port_when_adb_stays_absent(self) -> None:
+        control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.acroname_control_for_serial", return_value=control),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                side_effect=[
+                    {"ok": True, "status": "ok", "message": "Acroname USBHub3c port 5 on; result=0"},
+                    {"ok": True, "status": "ok", "message": "Acroname USBHub3c port 5 cycle; result=0"},
+                ],
+            ) as port_action,
+            patch("usb_android_monitor.reconnect_device", return_value={"ok": True, "message": "reconnect"}),
+            patch("usb_android_monitor.wait_for_adb_present", side_effect=[(False, "absent"), (False, "absent"), (True, "device")]),
+            patch("usb_android_monitor.time.sleep"),
+            patch("usb_android_monitor.forget_disconnected_target") as forget,
+        ):
+            result = connect_device("SERIAL1")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(port_action.call_args_list[1].args[2], "cycle")
+        self.assertIn("adb returned after retry cycle", result["message"])
+        forget.assert_called_once_with("SERIAL1")
 
     def test_acroname_disconnect_keeps_powered_off_state_when_verified(self) -> None:
         control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}

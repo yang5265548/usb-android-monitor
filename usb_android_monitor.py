@@ -1660,10 +1660,34 @@ def connect_device(serial: str) -> dict[str, Any]:
                     f"{' | '.join(messages)} | adb returned within wait window; state={state}",
                     serial,
                 )
+            messages.append(reconnect_device("")["message"])
+            present, state = wait_for_adb_present(serial, timeout_seconds=35.0)
+            if present:
+                forget_disconnected_target(serial)
+                return record_action(
+                    "connect",
+                    True,
+                    f"{' | '.join(messages)} | adb returned after global discovery; state={state}",
+                    serial,
+                )
+            cycle = run_acroname_port_action(serial, acroname, "cycle")
+            messages.append(f"acroname retry cycle: {cycle['message']}")
+            if cycle["ok"]:
+                time.sleep(float(acroname.get("post_cycle_wait_seconds", 4)))
+                messages.append(reconnect_device("")["message"])
+                present, state = wait_for_adb_present(serial, timeout_seconds=45.0)
+                if present:
+                    forget_disconnected_target(serial)
+                    return record_action(
+                        "connect",
+                        True,
+                        f"{' | '.join(messages)} | adb returned after retry cycle; state={state}",
+                        serial,
+                    )
             return record_action(
                 "connect",
                 False,
-                f"{' | '.join(messages)} | Acroname port is on, but serial stayed absent from adb after 25s",
+                f"{' | '.join(messages)} | Acroname port is on, but serial stayed absent from adb after retry",
                 serial,
             )
     elif platform.system().lower() == "linux":

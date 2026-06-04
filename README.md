@@ -159,6 +159,16 @@ python -m pip install --user --upgrade brainstem
 - The recent log also records ADB device events detected by polling, including
   `device-connected`, `device-disconnected`, and `device-changed`. The first dashboard refresh
   only establishes a baseline; later automatic disconnects and reconnects are logged.
+- When a phone disappears from ADB after the baseline, the service writes a `disconnect_diagnosis`
+  entry. It includes `reason`, `confidence`, `affected_serials`, the previous ADB USB path and
+  transport id, and the evidence used for the decision. Reasons are software-side diagnoses, not
+  guaranteed hub firmware error codes. Examples include `manual_disconnect`, `auto_map_probe`,
+  `hub_port_power_off`, `hub_or_upstream_disconnect`, and `unknown_external_disconnect`.
+- The service also captures nearby OS USB logs as `platform_usb_events` when a disconnect is
+  detected. On Windows this uses Event Log providers such as Kernel-PnP and UserPnp. On Linux it
+  uses `journalctl -k` when available, otherwise `dmesg`. These entries are the closest source to
+  low-level USB evidence; Android ADB, Acroname BrainStem, and most USB hubs do not normally report
+  a single explicit "why the phone disconnected" error.
 - If the USB cable or hub is physically disconnected, software cannot force the device back.
   It can only restart ADB discovery, reset the operating system's USB device, or power-cycle a
   supported Hub port.

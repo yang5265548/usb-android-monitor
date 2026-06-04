@@ -8,6 +8,7 @@ from usb_android_monitor import (
     acroname_control_for_serial,
     acroname_mapping_control,
     configured_devices,
+    diagnose_disconnect,
     disconnect_device,
     format_text_log,
     flatten_usb_tree,
@@ -35,6 +36,7 @@ class UsbAndroidMonitorTest(unittest.TestCase):
             usb_android_monitor.ADB_EVENT_STATE.clear()
             usb_android_monitor.ADB_EVENT_LOG_INITIALIZED = False
             usb_android_monitor.LAST_ADB_RAW_OUTPUT = ""
+            usb_android_monitor.EVENT_HISTORY.clear()
         usb_android_monitor.LOG_ENABLED = False
 
     def tearDown(self) -> None:
@@ -133,6 +135,55 @@ class UsbAndroidMonitorTest(unittest.TestCase):
         self.assertIn("backend=acroname", line)
         self.assertIn("port=2", line)
         self.assertIn("message=port off failed", line)
+
+    def test_disconnect_diagnosis_uses_recent_manual_action(self) -> None:
+        with TemporaryDirectory() as log_dir:
+            old_dir = usb_android_monitor.LOG_DIR
+            old_latest_initialized = usb_android_monitor.LATEST_LOGS_INITIALIZED
+            usb_android_monitor.LOG_DIR = log_dir
+            usb_android_monitor.LATEST_LOGS_INITIALIZED = False
+            usb_android_monitor.LOG_ENABLED = True
+            try:
+                write_log("action_started", {"action": "disconnect", "serial": "SERIAL1"})
+                diagnose_disconnect(
+                    "SERIAL1",
+                    ["SERIAL1"],
+                    ("device", "2-2.3", "7", True),
+                    {"backend": "test-usb-log", "ok": True, "raw": "usb disconnect"},
+                )
+                entries = recent_persistent_logs(20)
+            finally:
+                usb_android_monitor.LOG_DIR = old_dir
+                usb_android_monitor.LATEST_LOGS_INITIALIZED = old_latest_initialized
+
+        diagnosis = next(entry for entry in entries if entry["event"] == "disconnect_diagnosis")
+        self.assertEqual(diagnosis["reason"], "manual_disconnect")
+        self.assertEqual(diagnosis["confidence"], "high")
+        self.assertIn("recent manual disconnect", diagnosis["message"])
+
+    def test_disconnect_diagnosis_flags_multi_device_loss(self) -> None:
+        with TemporaryDirectory() as log_dir:
+            old_dir = usb_android_monitor.LOG_DIR
+            old_latest_initialized = usb_android_monitor.LATEST_LOGS_INITIALIZED
+            usb_android_monitor.LOG_DIR = log_dir
+            usb_android_monitor.LATEST_LOGS_INITIALIZED = False
+            usb_android_monitor.LOG_ENABLED = True
+            try:
+                diagnose_disconnect(
+                    "SERIAL1",
+                    ["SERIAL1", "SERIAL2"],
+                    ("device", "", "7", False),
+                    {"backend": "test-usb-log", "ok": True, "raw": "hub reset"},
+                )
+                entries = recent_persistent_logs(20)
+            finally:
+                usb_android_monitor.LOG_DIR = old_dir
+                usb_android_monitor.LATEST_LOGS_INITIALIZED = old_latest_initialized
+
+        diagnosis = next(entry for entry in entries if entry["event"] == "disconnect_diagnosis")
+        self.assertEqual(diagnosis["reason"], "hub_or_upstream_disconnect")
+        self.assertEqual(diagnosis["confidence"], "high")
+        self.assertEqual(diagnosis["affected_serials"], ["SERIAL1", "SERIAL2"])
 
     def test_non_android_usb_device_is_not_candidate(self) -> None:
         state = {

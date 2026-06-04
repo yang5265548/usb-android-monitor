@@ -71,6 +71,7 @@ STATE_PATH = os.environ.get("USB_ANDROID_MONITOR_STATE", "usb_android_monitor_st
 LOG_DIR = os.environ.get("USB_ANDROID_MONITOR_LOG_DIR", "logs")
 LOG_ENABLED = os.environ.get("USB_ANDROID_MONITOR_LOG_ENABLED", "1") != "0"
 LOG_LOCK = threading.Lock()
+EVENT_HISTORY: list[dict[str, Any]] = []
 LAST_ADB_RAW_OUTPUT = ""
 COMMAND_LOG_OUTPUT_LIMIT = 4000
 RUN_STARTED_AT = dt.datetime.now().astimezone()
@@ -216,8 +217,11 @@ def format_text_log(entry: dict[str, Any]) -> str:
         "status",
         "result_code",
         "duration_ms",
+        "reason",
+        "confidence",
+        "affected_serials",
     ):
-        if key in entry and entry[key] not in {None, ""}:
+        if key in entry and entry[key] is not None and entry[key] != "":
             parts.append(f"{key}={compact_log_value(entry[key])}")
     message = entry.get("message")
     if message:
@@ -239,8 +243,12 @@ def write_log(event: str, fields: dict[str, Any] | None = None) -> None:
     }
     if fields:
         entry.update(fields)
+    history_entry = dict(entry)
+    history_entry["_mono"] = time.monotonic()
     try:
         with LOG_LOCK:
+            EVENT_HISTORY.append(history_entry)
+            del EVENT_HISTORY[:-500]
             os.makedirs(LOG_DIR, exist_ok=True)
             os.makedirs(os.path.dirname(log_file_path()), exist_ok=True)
             initialize_latest_logs()
@@ -258,6 +266,12 @@ def write_log(event: str, fields: dict[str, Any] | None = None) -> None:
                 handle.write("\n")
     except OSError:
         pass
+
+
+def recent_log_entries(seconds: float = 30.0) -> list[dict[str, Any]]:
+    cutoff = time.monotonic() - seconds
+    with LOG_LOCK:
+        return [dict(entry) for entry in EVENT_HISTORY if float(entry.get("_mono", 0)) >= cutoff]
 
 
 def recent_persistent_logs(limit: int = 100) -> list[dict[str, Any]]:
@@ -287,6 +301,112 @@ def recent_persistent_logs(limit: int = 100) -> list[dict[str, Any]]:
         if isinstance(parsed, dict):
             entries.append(parsed)
     return list(reversed(entries))
+
+
+def collect_platform_usb_events(seconds: int = 60) -> dict[str, Any]:
+    system = platform.system().lower()
+    if system == "windows":
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            return {"backend": "windows-eventlog", "ok": False, "message": "PowerShell is not available"}
+        script = (
+            "$start=(Get-Date).AddSeconds(-%d); "
+            "$providers=@('Microsoft-Windows-Kernel-PnP','Microsoft-Windows-UserPnp','Microsoft-Windows-DriverFrameworks-UserMode'); "
+            "Get-WinEvent -FilterHashtable @{StartTime=$start; ProviderName=$providers} -ErrorAction SilentlyContinue | "
+            "Select-Object -First 30 TimeCreated,ProviderName,Id,LevelDisplayName,Message | ConvertTo-Json -Compress"
+        ) % seconds
+        result = run_command([powershell, "-NoProfile", "-Command", script], timeout=8)
+        output = (result.stdout or result.stderr).strip()
+        return {
+            "backend": "windows-eventlog",
+            "ok": result.returncode == 0,
+            "returncode": result.returncode,
+            "raw": truncate_text(output, 6000),
+        }
+    if system == "linux":
+        if shutil.which("journalctl"):
+            result = run_command(["journalctl", "-k", f"--since={seconds} seconds ago", "-n", "80", "--no-pager"], timeout=8)
+            output = (result.stdout or result.stderr).strip()
+            return {
+                "backend": "journalctl-kernel",
+                "ok": result.returncode == 0,
+                "returncode": result.returncode,
+                "raw": truncate_text(output, 6000),
+            }
+        if shutil.which("dmesg"):
+            result = run_command(["dmesg", "--ctime", "--level=err,warn,notice,info"], timeout=8)
+            output = "\n".join((result.stdout or result.stderr).splitlines()[-80:])
+            return {
+                "backend": "dmesg",
+                "ok": result.returncode == 0,
+                "returncode": result.returncode,
+                "raw": truncate_text(output, 6000),
+            }
+    return {"backend": "unsupported", "ok": False, "message": f"no platform USB log collector for {platform.system()}"}
+
+
+def diagnose_disconnect(
+    serial: str,
+    affected_serials: list[str],
+    previous_signature: tuple[str, str, str, bool],
+    system_events: dict[str, Any] | None = None,
+) -> None:
+    recent = recent_log_entries(30)
+    evidence: list[str] = []
+    reason = "unknown_external_disconnect"
+    confidence = "low"
+
+    has_map = any(entry.get("event") == "acroname_map_port_probe_started" for entry in recent) or any(
+        entry.get("action") == "map-acroname" for entry in recent
+    )
+    has_manual_disconnect = any(
+        entry.get("action") == "disconnect" and entry.get("serial") in {serial, ""}
+        for entry in recent
+    )
+    hub_off = [
+        entry
+        for entry in recent
+        if entry.get("event") == "hub_port_action_result" and entry.get("action") == "off"
+    ]
+    if has_map:
+        reason = "auto_map_probe"
+        confidence = "high"
+        evidence.append("recent Acroname auto-map probe was running")
+    elif has_manual_disconnect:
+        reason = "manual_disconnect"
+        confidence = "high"
+        evidence.append("recent manual disconnect action for this serial")
+    elif any(entry.get("ok") is True for entry in hub_off):
+        reason = "hub_port_power_off"
+        confidence = "high"
+        evidence.append("recent hub port off action returned ok")
+    elif len(affected_serials) > 1:
+        reason = "hub_or_upstream_disconnect"
+        confidence = "high"
+        evidence.append(f"{len(affected_serials)} ADB serials disappeared in the same poll")
+    else:
+        evidence.append("serial disappeared from ADB without a matching recent software action")
+
+    if system_events:
+        backend = system_events.get("backend", "unknown")
+        ok = system_events.get("ok")
+        evidence.append(f"platform_usb_log backend={backend} ok={ok}")
+
+    write_log(
+        "disconnect_diagnosis",
+        {
+            "serial": serial,
+            "affected_serials": affected_serials,
+            "previous_state": previous_signature[0],
+            "previous_usb_path": previous_signature[1],
+            "previous_transport_id": previous_signature[2],
+            "reason": reason,
+            "confidence": confidence,
+            "evidence": evidence,
+            "system_events": system_events or {},
+            "message": "; ".join(evidence),
+        },
+    )
 
 
 def run_action_async(action: str, serial: str) -> dict[str, Any]:
@@ -366,6 +486,7 @@ def record_adb_device_events(devices: list[dict[str, Any]]) -> None:
 
     current = {str(device["serial"]): adb_event_signature(device) for device in devices if device.get("serial")}
     events: list[tuple[str, str, str, str]] = []
+    disconnected: list[tuple[str, tuple[str, str, str, bool]]] = []
     with ACTION_LOCK:
         previous = dict(ADB_EVENT_STATE)
         if not ADB_EVENT_LOG_INITIALIZED:
@@ -397,6 +518,7 @@ def record_adb_device_events(devices: list[dict[str, Any]]) -> None:
                 )
         for serial, signature in previous.items():
             if serial not in current:
+                disconnected.append((serial, signature))
                 events.append(
                     (
                         "device-disconnected",
@@ -410,6 +532,12 @@ def record_adb_device_events(devices: list[dict[str, Any]]) -> None:
 
     for action, serial, status, message in events:
         record_action(action, True, message, serial, status=status)
+    if disconnected:
+        system_events = collect_platform_usb_events(60)
+        write_log("platform_usb_events", system_events)
+        affected = [serial for serial, _ in disconnected]
+        for serial, signature in disconnected:
+            diagnose_disconnect(serial, affected, signature, system_events)
 
 
 def dashboard_diagnostics() -> list[dict[str, str]]:

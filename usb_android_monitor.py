@@ -73,6 +73,9 @@ LOG_ENABLED = os.environ.get("USB_ANDROID_MONITOR_LOG_ENABLED", "1") != "0"
 LOG_LOCK = threading.Lock()
 LAST_ADB_RAW_OUTPUT = ""
 COMMAND_LOG_OUTPUT_LIMIT = 4000
+RUN_STARTED_AT = dt.datetime.now().astimezone()
+RUN_ID = os.environ.get("USB_ANDROID_MONITOR_RUN_ID", f"{RUN_STARTED_AT:%Y%m%d-%H%M%S}-pid{os.getpid()}")
+LATEST_LOGS_INITIALIZED = False
 
 
 @dataclass(frozen=True)
@@ -128,13 +131,35 @@ def now_iso() -> str:
 
 
 def log_file_path(timestamp: dt.datetime | None = None) -> str:
-    stamp = timestamp or dt.datetime.now().astimezone()
-    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}.jsonl")
+    stamp = timestamp or RUN_STARTED_AT
+    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}_{RUN_ID}.jsonl")
 
 
 def text_log_file_path(timestamp: dt.datetime | None = None) -> str:
-    stamp = timestamp or dt.datetime.now().astimezone()
-    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}.log")
+    stamp = timestamp or RUN_STARTED_AT
+    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}_{RUN_ID}.log")
+
+
+def latest_jsonl_log_path() -> str:
+    return os.path.join(LOG_DIR, "latest.jsonl")
+
+
+def latest_text_log_path() -> str:
+    return os.path.join(LOG_DIR, "latest.log")
+
+
+def initialize_latest_logs() -> None:
+    global LATEST_LOGS_INITIALIZED
+
+    if LATEST_LOGS_INITIALIZED:
+        return
+    for path in (latest_jsonl_log_path(), latest_text_log_path()):
+        try:
+            with open(path, "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
+    LATEST_LOGS_INITIALIZED = True
 
 
 def truncate_text(value: Any, limit: int = COMMAND_LOG_OUTPUT_LIMIT) -> str:
@@ -209,16 +234,24 @@ def write_log(event: str, fields: dict[str, Any] | None = None) -> None:
         "event": event,
         "pid": os.getpid(),
         "platform": platform.system(),
+        "run_id": RUN_ID,
     }
     if fields:
         entry.update(fields)
     try:
         with LOG_LOCK:
             os.makedirs(LOG_DIR, exist_ok=True)
+            initialize_latest_logs()
             with open(log_file_path(), "a", encoding="utf-8") as handle:
                 json.dump(entry, handle, ensure_ascii=False, sort_keys=True)
                 handle.write("\n")
+            with open(latest_jsonl_log_path(), "a", encoding="utf-8") as handle:
+                json.dump(entry, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
             with open(text_log_file_path(), "a", encoding="utf-8") as handle:
+                handle.write(format_text_log(entry))
+                handle.write("\n")
+            with open(latest_text_log_path(), "a", encoding="utf-8") as handle:
                 handle.write(format_text_log(entry))
                 handle.write("\n")
     except OSError:
@@ -1682,6 +1715,9 @@ def snapshot() -> dict[str, Any]:
         "config_path": CONFIG_PATH,
         "state_path": STATE_PATH,
         "log_dir": LOG_DIR,
+        "run_id": RUN_ID,
+        "run_log_path": text_log_file_path(),
+        "latest_log_path": latest_text_log_path(),
         "configured_device_count": len(configured_devices(config)),
         "active_actions": active_actions_snapshot(),
         "last_actions": last_actions_snapshot(),
@@ -1980,7 +2016,7 @@ INDEX_HTML = """<!doctype html>
       const state = await response.json();
       updatedEl.textContent = `Updated ${state.timestamp} · ${state.platform} · USB backend ${state.usb_backend} · ADB ${state.adb_available ? "available" : "not installed"}`;
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Config file: ${state.config_path}. Logs: ${state.log_dir}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Auto-map Acroname ports</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Auto-map Acroname ports</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")
@@ -2006,7 +2042,7 @@ INDEX_HTML = """<!doctype html>
         : `<article class="device"><div class="name">No USB context available</div><div class="meta">Install lsusb on Ubuntu, or run on Windows with PowerShell available.</div></article>`;
       actionsEl.innerHTML = state.last_actions.length
         ? state.last_actions.map(actionCard).join("")
-        : `<article class="device"><div class="name">No actions yet in this service run</div><div class="meta">Readable .log and structured .jsonl files are stored under ${state.log_dir}.</div></article>`;
+        : `<article class="device"><div class="name">No actions yet in this service run</div><div class="meta">Current readable log: ${state.latest_log_path}</div></article>`;
     }
 
     function refreshLater(delayMs) {
@@ -2079,6 +2115,9 @@ def serve(host: str, port: int) -> None:
             "config_path": CONFIG_PATH,
             "state_path": STATE_PATH,
             "log_dir": LOG_DIR,
+            "run_id": RUN_ID,
+            "run_log_path": text_log_file_path(),
+            "latest_log_path": latest_text_log_path(),
             "python": sys.version,
             "adb_available": bool(shutil.which("adb")),
             "brainstem_available": brainstem_available(),

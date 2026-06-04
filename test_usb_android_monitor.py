@@ -78,22 +78,35 @@ class UsbAndroidMonitorTest(unittest.TestCase):
     def test_persistent_logs_round_trip_jsonl(self) -> None:
         with TemporaryDirectory() as log_dir:
             old_dir = usb_android_monitor.LOG_DIR
+            old_latest_initialized = usb_android_monitor.LATEST_LOGS_INITIALIZED
             usb_android_monitor.LOG_DIR = log_dir
+            usb_android_monitor.LATEST_LOGS_INITIALIZED = False
             usb_android_monitor.LOG_ENABLED = True
             try:
                 write_log("unit_test_event", {"serial": "SERIAL1", "message": "hello"})
                 entries = recent_persistent_logs(10)
-                text_logs = [name for name in os.listdir(log_dir) if name.endswith(".log")]
-                json_logs = [name for name in os.listdir(log_dir) if name.endswith(".jsonl")]
-                with open(os.path.join(log_dir, text_logs[0]), "r", encoding="utf-8") as handle:
+                text_logs = [
+                    name
+                    for name in os.listdir(log_dir)
+                    if name.startswith("usb_android_monitor-") and name.endswith(".log")
+                ]
+                json_logs = [
+                    name
+                    for name in os.listdir(log_dir)
+                    if name.startswith("usb_android_monitor-") and name.endswith(".jsonl")
+                ]
+                latest_jsonl_exists = os.path.exists(os.path.join(log_dir, "latest.jsonl"))
+                with open(os.path.join(log_dir, "latest.log"), "r", encoding="utf-8") as handle:
                     text_content = handle.read()
             finally:
                 usb_android_monitor.LOG_DIR = old_dir
+                usb_android_monitor.LATEST_LOGS_INITIALIZED = old_latest_initialized
 
         self.assertEqual(entries[0]["event"], "unit_test_event")
         self.assertEqual(entries[0]["serial"], "SERIAL1")
         self.assertEqual(len(text_logs), 1)
         self.assertEqual(len(json_logs), 1)
+        self.assertTrue(latest_jsonl_exists)
         self.assertIn("unit_test_event", text_content)
         self.assertIn("serial=SERIAL1", text_content)
 

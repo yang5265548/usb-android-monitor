@@ -146,13 +146,13 @@ python -m pip install --user --upgrade brainstem
 
 ## Notes
 
-- Persistent logs are written under the project-local `logs/` directory, with one readable `.log`
-  file and one structured `.jsonl` file per day. Start with
-  `logs/usb_android_monitor-YYYY-MM-DD.log` for manual review; use the matching `.jsonl` when you
-  need machine parsing. Override the path with `USB_ANDROID_MONITOR_LOG_DIR`, or disable file
-  logging with `USB_ANDROID_MONITOR_LOG_ENABLED=0`. Logs include service startup, action results,
-  ADB snapshot changes, failed or slow commands, Acroname port actions, and Acroname auto-map
-  probe details.
+- Persistent logs are written under the project-local `logs/` directory. Each service start gets
+  a separate readable `.log` and structured `.jsonl` run file, such as
+  `logs/usb_android_monitor-2026-06-04_20260604-103215-pid1234.log`. `logs/latest.log` and
+  `logs/latest.jsonl` are reset on startup and always point to the current run. Override the path
+  with `USB_ANDROID_MONITOR_LOG_DIR`, or disable file logging with
+  `USB_ANDROID_MONITOR_LOG_ENABLED=0`. Logs include service startup, action results, ADB snapshot
+  changes, failed or slow commands, Acroname port actions, and Acroname auto-map probe details.
 - Dashboard actions are asynchronous. A `*-queued` entry means the request was accepted; the
   final `disconnect`, `recover`, `reconnect`, or `verify` entry appears when the background check
   completes.

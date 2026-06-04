@@ -40,6 +40,7 @@ class UsbAndroidMonitorTest(unittest.TestCase):
             usb_android_monitor.LAST_ADB_RAW_OUTPUT = ""
             usb_android_monitor.EVENT_HISTORY.clear()
             usb_android_monitor.MANUAL_DISCONNECT_UNTIL.clear()
+            usb_android_monitor.HUB_BACKEND = "acroname"
         usb_android_monitor.LOG_ENABLED = False
 
     def tearDown(self) -> None:
@@ -235,6 +236,7 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         )
 
     def test_recovery_plan_includes_configured_hub_port(self) -> None:
+        usb_android_monitor.HUB_BACKEND = "uhubctl"
         config = {
             "devices": {
                 "R58N123456": {
@@ -531,6 +533,7 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         with (
             patch("usb_android_monitor.load_config", return_value={"devices": {}}),
             patch("usb_android_monitor.platform.system", return_value="Linux"),
+            patch("usb_android_monitor.hub_backend", return_value="uhubctl"),
             patch("usb_android_monitor.brainstem_available", return_value=False),
             patch("usb_android_monitor.acroname_control_for_serial", return_value=stale_acroname),
             patch("usb_android_monitor.uhubctl_target_for_serial", return_value=uhubctl),
@@ -624,6 +627,7 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         with (
             patch("usb_android_monitor.load_config", return_value={"devices": {}}),
             patch("usb_android_monitor.platform.system", return_value="Linux"),
+            patch("usb_android_monitor.hub_backend", return_value="uhubctl"),
             patch("usb_android_monitor.brainstem_available", return_value=False),
             patch("usb_android_monitor.acroname_control_for_serial", return_value=stale_acroname),
             patch("usb_android_monitor.uhubctl_target_for_serial", return_value=uhubctl),
@@ -641,7 +645,30 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
     def test_configured_devices_rejects_non_dict(self) -> None:
         self.assertEqual(configured_devices({"devices": []}), {})
 
+    def test_hub_backend_can_be_forced_to_uhubctl(self) -> None:
+        self.assertEqual(usb_android_monitor.select_hub_backend({"hub_backend": "acthub"}), "uhubctl")
+        self.assertEqual(usb_android_monitor.select_hub_backend({"hub_control": {"type": "uhubctl"}}), "uhubctl")
+
+    def test_hub_backend_auto_prefers_uhubctl_when_available(self) -> None:
+        with (
+            patch("usb_android_monitor.shutil.which", return_value="/usr/bin/uhubctl"),
+            patch("usb_android_monitor.brainstem_available", return_value=True),
+        ):
+            backend = usb_android_monitor.select_hub_backend({"devices": {}})
+
+        self.assertEqual(backend, "uhubctl")
+
+    def test_hub_backend_auto_uses_acroname_without_uhubctl(self) -> None:
+        with (
+            patch("usb_android_monitor.shutil.which", return_value=None),
+            patch("usb_android_monitor.brainstem_available", return_value=True),
+        ):
+            backend = usb_android_monitor.select_hub_backend({"devices": {}})
+
+        self.assertEqual(backend, "acroname")
+
     def test_snapshot_lists_known_powered_off_device_as_missing(self) -> None:
+        usb_android_monitor.HUB_BACKEND = "uhubctl"
         known = {
             "SERIAL1": {
                 "name": "Rack phone 1",

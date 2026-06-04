@@ -77,6 +77,7 @@ COMMAND_LOG_OUTPUT_LIMIT = 4000
 RUN_STARTED_AT = dt.datetime.now().astimezone()
 RUN_ID = os.environ.get("USB_ANDROID_MONITOR_RUN_ID", f"{RUN_STARTED_AT:%Y%m%d-%H%M%S}-pid{os.getpid()}")
 LATEST_LOGS_INITIALIZED = False
+HUB_BACKEND = os.environ.get("USB_ANDROID_MONITOR_HUB_BACKEND", "auto").strip().lower() or "auto"
 
 
 @dataclass(frozen=True)
@@ -628,6 +629,65 @@ def configured_devices(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return devices if isinstance(devices, dict) else {}
 
 
+def normalize_hub_backend(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "none": "none",
+        "disabled": "none",
+        "off": "none",
+        "acroname": "acroname",
+        "brainstem": "acroname",
+        "usbhub3c": "acroname",
+        "uhubctl": "uhubctl",
+        "acthub": "uhubctl",
+        "linux": "uhubctl",
+    }
+    return aliases.get(raw, "auto")
+
+
+def configured_hub_backend(config: dict[str, Any]) -> str:
+    for key in ("hub_backend", "backend"):
+        if key in config:
+            return normalize_hub_backend(config.get(key))
+    hub_control = config.get("hub_control", {})
+    if isinstance(hub_control, dict) and hub_control.get("type"):
+        return normalize_hub_backend(hub_control.get("type"))
+    return normalize_hub_backend(os.environ.get("USB_ANDROID_MONITOR_HUB_BACKEND", "auto"))
+
+
+def select_hub_backend(config: dict[str, Any]) -> str:
+    requested = configured_hub_backend(config)
+    if requested in {"acroname", "uhubctl", "none"}:
+        return requested
+    if shutil.which("uhubctl"):
+        return "uhubctl"
+    if brainstem_available():
+        return "acroname"
+    return "none"
+
+
+def initialize_hub_backend(config: dict[str, Any] | None = None) -> str:
+    global HUB_BACKEND
+    selected_config = config or load_config()
+    HUB_BACKEND = select_hub_backend(selected_config)
+    write_log(
+        "hub_backend_selected",
+        {
+            "hub_backend": HUB_BACKEND,
+            "requested": configured_hub_backend(selected_config),
+            "uhubctl_available": bool(shutil.which("uhubctl")),
+            "brainstem_available": brainstem_available(),
+        },
+    )
+    return HUB_BACKEND
+
+
+def hub_backend() -> str:
+    return HUB_BACKEND
+
+
 def load_state(path: str = STATE_PATH) -> dict[str, Any]:
     if not os.path.exists(path):
         return {"known_devices": {}}
@@ -893,6 +953,15 @@ def uhubctl_target_for_serial(serial: str, config: dict[str, Any]) -> dict[str, 
     if not adb_device:
         return {}
     return infer_uhubctl_target_from_usb_path(adb_device.usb_path)
+
+
+def power_target_for_serial(serial: str, config: dict[str, Any]) -> dict[str, Any]:
+    backend = hub_backend()
+    if backend == "acroname":
+        return acroname_control_for_serial(serial, config)
+    if backend == "uhubctl":
+        return uhubctl_target_for_serial(serial, config)
+    return {}
 
 
 def remember_disconnected_target(serial: str, target: dict[str, Any]) -> None:
@@ -1171,12 +1240,15 @@ def reconnect_device(serial: str = "") -> dict[str, Any]:
 def recovery_plan_for_serial(serial: str, config: dict[str, Any]) -> list[str]:
     steps = ["adb start-server", "adb reconnect"]
     device_config = configured_devices(config).get(serial, {})
-    acroname = acroname_control_for_serial(serial, config)
-    if acroname:
-        steps.append(f"acroname {acroname.get('action', 'port')} cycle port={acroname['port']}")
-    uhubctl = device_config.get("uhubctl", {})
-    if uhubctl.get("enabled", True) and uhubctl.get("location") and uhubctl.get("port"):
-        steps.append(f"uhubctl cycle location={uhubctl['location']} port={uhubctl['port']}")
+    backend = hub_backend()
+    if backend == "acroname":
+        acroname = acroname_control_for_serial(serial, config)
+        if acroname:
+            steps.append(f"acroname {acroname.get('action', 'port')} cycle port={acroname['port']}")
+    elif backend == "uhubctl":
+        uhubctl = uhubctl_target_for_serial(serial, config)
+        if uhubctl.get("location") and uhubctl.get("port"):
+            steps.append(f"uhubctl cycle location={uhubctl['location']} port={uhubctl['port']}")
     windows_instance_id = device_config.get("windows_instance_id", "")
     if windows_instance_id:
         steps.append(f"pnputil restart-device {windows_instance_id}")
@@ -1404,6 +1476,12 @@ def wait_for_serials_present(serials: set[str], timeout_seconds: float = 25.0) -
 
 
 def map_acroname_ports(_: str = "") -> dict[str, Any]:
+    if hub_backend() != "acroname":
+        return record_action(
+            "map-acroname",
+            False,
+            f"Acroname mapping is unavailable because active hub backend is {hub_backend()}",
+        )
     config = load_config()
     mapping_control = acroname_mapping_control(config)
     ports = normalized_acroname_ports(mapping_control.get("ports", []))
@@ -1612,23 +1690,28 @@ def recover_device(serial: str = "", reason: str = "manual", allow_power_cycle: 
     first = reconnect_device(serial)
     messages.append(first["message"])
 
-    system = platform.system().lower()
     if allow_power_cycle and serial:
-        acroname = acroname_control_for_serial(serial, config)
-        if acroname:
-            result = run_acroname_port_action(serial, acroname, "cycle")
-            messages.append(result["message"])
-            time.sleep(2)
-            messages.append(reconnect_device(serial)["message"])
-        elif system == "linux":
+        backend = hub_backend()
+        if backend == "acroname":
+            acroname = acroname_control_for_serial(serial, config)
+            if not acroname:
+                messages.append("no Acroname target for active backend")
+            else:
+                result = run_acroname_port_action(serial, acroname, "cycle")
+                messages.append(result["message"])
+                time.sleep(2)
+                messages.append(reconnect_device(serial)["message"])
+        elif backend == "uhubctl":
             uhubctl_target = uhubctl_target_for_serial(serial, config)
-            if uhubctl_target:
+            if not uhubctl_target:
+                messages.append("no uhubctl target for active backend")
+            else:
                 result = power_cycle_linux_hub_port(serial, uhubctl_target)
                 messages.append(f"uhubctl source={uhubctl_target.get('source', '-')}")
                 messages.append(result["message"])
                 time.sleep(2)
                 messages.append(reconnect_device(serial)["message"])
-        elif system == "windows" and device_config.get("windows_instance_id"):
+        elif platform.system().lower() == "windows" and device_config.get("windows_instance_id"):
             result = restart_windows_usb_device(serial, device_config)
             messages.append(result["message"])
             time.sleep(2)
@@ -1643,81 +1726,8 @@ def connect_device(serial: str) -> dict[str, Any]:
     config = load_config()
     messages: list[str] = []
     ok = False
-    system = platform.system().lower()
-    acroname = acroname_control_for_serial(serial, config)
-    if system == "linux" and (not acroname or not brainstem_available()):
-        uhubctl_target = uhubctl_target_for_serial(serial, config)
-        if uhubctl_target:
-            result = power_on_linux_hub_port(serial, uhubctl_target)
-            messages.append(
-                f"hub port power on via {uhubctl_target.get('source', '-')}: {result['message']}"
-            )
-            ok = result["ok"]
-            if ok:
-                MANUAL_DISCONNECT_UNTIL.pop(serial, None)
-                messages.append(reconnect_device(serial)["message"])
-                present, state = wait_for_adb_present(serial)
-                if present:
-                    forget_disconnected_target(serial)
-                    return record_action(
-                        "connect",
-                        True,
-                        f"{' | '.join(messages)} | adb returned within wait window; state={state}",
-                        serial,
-                    )
-                return record_action(
-                    "connect",
-                    False,
-                    f"{' | '.join(messages)} | hub port is on, but serial stayed absent from adb after 25s",
-                    serial,
-                )
-    if acroname:
-        result = run_acroname_port_action(serial, acroname, "on")
-        messages.append(f"acroname port power/data on: {result['message']}")
-        ok = result["ok"]
-        if ok:
-            MANUAL_DISCONNECT_UNTIL.pop(serial, None)
-            messages.append(reconnect_device(serial)["message"])
-            present, state = wait_for_adb_present(serial)
-            if present:
-                forget_disconnected_target(serial)
-                return record_action(
-                    "connect",
-                    True,
-                    f"{' | '.join(messages)} | adb returned within wait window; state={state}",
-                    serial,
-                )
-            messages.append(reconnect_device("")["message"])
-            present, state = wait_for_adb_present(serial, timeout_seconds=35.0)
-            if present:
-                forget_disconnected_target(serial)
-                return record_action(
-                    "connect",
-                    True,
-                    f"{' | '.join(messages)} | adb returned after global discovery; state={state}",
-                    serial,
-                )
-            cycle = run_acroname_port_action(serial, acroname, "cycle")
-            messages.append(f"acroname retry cycle: {cycle['message']}")
-            if cycle["ok"]:
-                time.sleep(float(acroname.get("post_cycle_wait_seconds", 4)))
-                messages.append(reconnect_device("")["message"])
-                present, state = wait_for_adb_present(serial, timeout_seconds=45.0)
-                if present:
-                    forget_disconnected_target(serial)
-                    return record_action(
-                        "connect",
-                        True,
-                        f"{' | '.join(messages)} | adb returned after retry cycle; state={state}",
-                        serial,
-                    )
-            return record_action(
-                "connect",
-                False,
-                f"{' | '.join(messages)} | Acroname port is on, but serial stayed absent from adb after retry",
-                serial,
-            )
-    elif system == "linux":
+    backend = hub_backend()
+    if backend == "uhubctl":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:
             result = power_on_linux_hub_port(serial, uhubctl_target)
@@ -1745,6 +1755,56 @@ def connect_device(serial: str) -> dict[str, Any]:
                 )
         else:
             messages.append("no remembered or configured uhubctl target; only restarting ADB")
+    if backend == "acroname":
+        acroname = acroname_control_for_serial(serial, config)
+        if not acroname:
+            messages.append("no Acroname target for active backend")
+        else:
+            result = run_acroname_port_action(serial, acroname, "on")
+            messages.append(f"acroname port power/data on: {result['message']}")
+            ok = result["ok"]
+            if ok:
+                MANUAL_DISCONNECT_UNTIL.pop(serial, None)
+                messages.append(reconnect_device(serial)["message"])
+                present, state = wait_for_adb_present(serial)
+                if present:
+                    forget_disconnected_target(serial)
+                    return record_action(
+                        "connect",
+                        True,
+                        f"{' | '.join(messages)} | adb returned within wait window; state={state}",
+                        serial,
+                    )
+                messages.append(reconnect_device("")["message"])
+                present, state = wait_for_adb_present(serial, timeout_seconds=35.0)
+                if present:
+                    forget_disconnected_target(serial)
+                    return record_action(
+                        "connect",
+                        True,
+                        f"{' | '.join(messages)} | adb returned after global discovery; state={state}",
+                        serial,
+                    )
+                cycle = run_acroname_port_action(serial, acroname, "cycle")
+                messages.append(f"acroname retry cycle: {cycle['message']}")
+                if cycle["ok"]:
+                    time.sleep(float(acroname.get("post_cycle_wait_seconds", 4)))
+                    messages.append(reconnect_device("")["message"])
+                    present, state = wait_for_adb_present(serial, timeout_seconds=45.0)
+                    if present:
+                        forget_disconnected_target(serial)
+                        return record_action(
+                            "connect",
+                            True,
+                            f"{' | '.join(messages)} | adb returned after retry cycle; state={state}",
+                            serial,
+                        )
+                return record_action(
+                    "connect",
+                    False,
+                    f"{' | '.join(messages)} | Acroname port is on, but serial stayed absent from adb after retry",
+                    serial,
+                )
     MANUAL_DISCONNECT_UNTIL.pop(serial, None)
     messages.append(reconnect_device(serial)["message"])
     ok, state = wait_for_adb_present(serial, timeout_seconds=12.0)
@@ -1759,23 +1819,9 @@ def disconnect_device(serial: str) -> dict[str, Any]:
     MANUAL_DISCONNECT_UNTIL[serial] = time.time() + 120
 
     config = load_config()
-    system = platform.system().lower()
+    backend = hub_backend()
     acroname = acroname_control_for_serial(serial, config)
-    if system == "linux" and (not acroname or not brainstem_available()):
-        uhubctl_target = uhubctl_target_for_serial(serial, config)
-        if uhubctl_target:
-            remember_disconnected_target(serial, uhubctl_target)
-            result = power_off_linux_hub_port(serial, uhubctl_target)
-            verified, last_state = wait_for_adb_absent(serial)
-            return record_action(
-                "disconnect",
-                result["ok"] and verified,
-                "hub port power off requested "
-                f"via {uhubctl_target.get('source', '-')}; adb verification="
-                f"{'absent' if verified else 'still ' + last_state}; {result['message']}",
-                serial,
-            )
-    if acroname:
+    if backend == "acroname" and acroname:
         before_serials = adb_serials()
         result = run_acroname_port_action(serial, acroname, "off")
         missing_serials, current_serials = wait_for_serials_missing_from_baseline(before_serials)
@@ -1851,7 +1897,7 @@ def disconnect_device(serial: str) -> dict[str, Any]:
             f"{'; warning: hub API reported failure but ADB verified disconnect' if verified and not result['ok'] else ''}",
             serial,
         )
-    if system == "windows" and brainstem_available():
+    if backend == "acroname" and brainstem_available():
         return record_action(
             "disconnect",
             False,
@@ -1859,7 +1905,7 @@ def disconnect_device(serial: str) -> dict[str, Any]:
             "the Android-side USB disable fallback is not a reliable computer-side disconnect.",
             serial,
         )
-    if system == "linux":
+    if backend == "uhubctl":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:
             remember_disconnected_target(serial, uhubctl_target)
@@ -1955,7 +2001,9 @@ def snapshot() -> dict[str, Any]:
     record_adb_device_events(android_devices)
     auto_reconnect_if_needed(android_devices, config)
     for device in android_devices:
-        device["acroname_control"] = acroname_control_for_serial(device["serial"], config)
+        device["acroname_control"] = acroname_control_for_serial(device["serial"], config) if hub_backend() == "acroname" else {}
+        device["uhubctl_target"] = uhubctl_target_for_serial(device["serial"], config) if hub_backend() == "uhubctl" else {}
+        device["power_target"] = power_target_for_serial(device["serial"], config)
     usb_android = [device for device in usb_devices if device.is_android_candidate]
     current_serials = {device["serial"] for device in android_devices}
     now = time.time()
@@ -1970,7 +2018,7 @@ def snapshot() -> dict[str, Any]:
             "name": str(device_config.get("name") or serial),
             "recovery_plan": recovery_plan_for_serial(serial, config),
             "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
-            "power_target": acroname_control_for_serial(serial, config) or uhubctl_target_for_serial(serial, config),
+            "power_target": power_target_for_serial(serial, config),
             "reason": "configured",
         }
         for serial, device_config in configured_devices(config).items()
@@ -1984,8 +2032,8 @@ def snapshot() -> dict[str, Any]:
         power_state = str(known.get("power_state") or "")
         if power_state == "on":
             continue
-        target = known.get("acroname_control", {})
-        if target.get("port") is not None:
+        target = known.get("acroname_control", {}) if hub_backend() == "acroname" else {}
+        if isinstance(target, dict) and target.get("port") is not None:
             missing_configured.append(
                 {
                     "serial": serial,
@@ -2000,8 +2048,8 @@ def snapshot() -> dict[str, Any]:
                 }
             )
             continue
-        target = known.get("uhubctl_target", {})
-        if not target.get("location") or not target.get("port"):
+        target = known.get("uhubctl_target", {}) if hub_backend() == "uhubctl" else {}
+        if not isinstance(target, dict) or not target.get("location") or not target.get("port"):
             continue
         missing_configured.append(
             {
@@ -2016,27 +2064,28 @@ def snapshot() -> dict[str, Any]:
                 "reason": power_state or "known-missing",
             }
         )
-    with ACTION_LOCK:
-        remembered_targets = {
-            serial: dict(target)
-            for serial, target in DISCONNECTED_TARGETS.items()
-            if serial not in current_serials
-        }
-    for serial, target in remembered_targets.items():
-        if not any(device["serial"] == serial for device in missing_configured):
-            missing_configured.append(
-                {
-                    "serial": serial,
-                    "name": serial,
-                    "recovery_plan": [
-                        f"uhubctl on location={target['location']} port={target['port']}",
-                        "adb reconnect",
-                    ],
-                    "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
-                    "power_target": target,
-                    "reason": "powered-off",
-                }
-            )
+    if hub_backend() == "uhubctl":
+        with ACTION_LOCK:
+            remembered_targets = {
+                serial: dict(target)
+                for serial, target in DISCONNECTED_TARGETS.items()
+                if serial not in current_serials
+            }
+        for serial, target in remembered_targets.items():
+            if not any(device["serial"] == serial for device in missing_configured):
+                missing_configured.append(
+                    {
+                        "serial": serial,
+                        "name": serial,
+                        "recovery_plan": [
+                            f"uhubctl on location={target['location']} port={target['port']}",
+                            "adb reconnect",
+                        ],
+                        "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
+                        "power_target": target,
+                        "reason": "powered-off",
+                    }
+                )
     behind_hub_count = sum(1 for device in android_devices if device["behind_hub"]) + sum(
         1 for device in usb_android if device.parent_hubs
     )
@@ -2044,6 +2093,7 @@ def snapshot() -> dict[str, Any]:
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "platform": platform.system(),
         "usb_backend": usb_backend,
+        "hub_backend": hub_backend(),
         "adb_available": bool(shutil.which("adb")),
         "acroname_available": brainstem_available(),
         "auto_reconnect_enabled": AUTO_RECONNECT_ENABLED,
@@ -2256,7 +2306,7 @@ INDEX_HTML = """<!doctype html>
         ? `<div class="hint">Hub control target: Acroname ${device.acroname_control.model || "USBHub3c"} port ${device.acroname_control.port} (${device.acroname_control.source || "state"})</div>`
         : device.uhubctl_target && device.uhubctl_target.location
         ? `<div class="hint">Hub control target: uhubctl -l ${device.uhubctl_target.location} -p ${device.uhubctl_target.port} (${device.uhubctl_target.source})</div>`
-        : state.acroname_available
+        : state.hub_backend === "acroname"
         ? `<div class="hint">No current Acroname port mapping. Run Refresh Acroname port map after phones are replugged or moved.</div>`
         : `<div class="hint">No controllable Hub port inferred yet. Disconnect will fall back to Android-side USB data disable.</div>`;
       const disabled = active ? "disabled" : "";
@@ -2349,9 +2399,12 @@ INDEX_HTML = """<!doctype html>
     async function refresh() {
       const response = await fetch("/api/state");
       const state = await response.json();
-      updatedEl.textContent = `Updated ${state.timestamp} · ${state.platform} · USB backend ${state.usb_backend} · ADB ${state.adb_available ? "available" : "not installed"}`;
+      updatedEl.textContent = `Updated ${state.timestamp} · ${state.platform} · USB backend ${state.usb_backend} · Hub backend ${state.hub_backend} · ADB ${state.adb_available ? "available" : "not installed"}`;
+      const mapButton = state.hub_backend === "acroname"
+        ? `<button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Refresh Acroname port map</button>`
+        : "";
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Refresh Acroname port map</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}.<div class="actions">${mapButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")
@@ -2456,6 +2509,8 @@ def serve(host: str, port: int) -> None:
             "python": sys.version,
             "adb_available": bool(shutil.which("adb")),
             "brainstem_available": brainstem_available(),
+            "uhubctl_available": bool(shutil.which("uhubctl")),
+            "hub_backend": hub_backend(),
         },
     )
     print(f"USB Android Monitor running at http://{host}:{port}")
@@ -2498,6 +2553,7 @@ def main() -> int:
     subparsers.add_parser("map-acroname", help="auto-map Acroname ports to visible ADB serials")
 
     args = parser.parse_args()
+    initialize_hub_backend()
     if args.command == "list":
         print_table(snapshot())
     elif args.command == "watch":

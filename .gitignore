@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 usb_android_monitor_state.json
 usb_android_monitor_state.json.tmp
+logs/

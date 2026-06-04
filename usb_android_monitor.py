@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import platform
@@ -67,6 +68,11 @@ MANUAL_DISCONNECT_UNTIL: dict[str, float] = {}
 DISCONNECTED_TARGETS: dict[str, dict[str, str]] = {}
 CONFIG_PATH = os.environ.get("USB_ANDROID_MONITOR_CONFIG", "usb_android_monitor_config.json")
 STATE_PATH = os.environ.get("USB_ANDROID_MONITOR_STATE", "usb_android_monitor_state.json")
+LOG_DIR = os.environ.get("USB_ANDROID_MONITOR_LOG_DIR", "logs")
+LOG_ENABLED = os.environ.get("USB_ANDROID_MONITOR_LOG_ENABLED", "1") != "0"
+LOG_LOCK = threading.Lock()
+LAST_ADB_RAW_OUTPUT = ""
+COMMAND_LOG_OUTPUT_LIMIT = 4000
 
 
 @dataclass(frozen=True)
@@ -113,7 +119,79 @@ def record_action(action: str, ok: bool, message: str, serial: str = "", status:
     with ACTION_LOCK:
         LAST_ACTIONS.insert(0, entry)
         del LAST_ACTIONS[30:]
+    write_log("action", entry)
     return entry
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def log_file_path(timestamp: dt.datetime | None = None) -> str:
+    stamp = timestamp or dt.datetime.now().astimezone()
+    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}.jsonl")
+
+
+def truncate_text(value: Any, limit: int = COMMAND_LOG_OUTPUT_LIMIT) -> str:
+    if value is None:
+        text = ""
+    elif isinstance(value, bytes):
+        text = value.decode(errors="replace")
+    else:
+        text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...<truncated {len(text) - limit} chars>"
+
+
+def write_log(event: str, fields: dict[str, Any] | None = None) -> None:
+    if not LOG_ENABLED:
+        return
+    entry = {
+        "ts": now_iso(),
+        "event": event,
+        "pid": os.getpid(),
+        "platform": platform.system(),
+    }
+    if fields:
+        entry.update(fields)
+    try:
+        with LOG_LOCK:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(log_file_path(), "a", encoding="utf-8") as handle:
+                json.dump(entry, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+    except OSError:
+        pass
+
+
+def recent_persistent_logs(limit: int = 100) -> list[dict[str, Any]]:
+    if not LOG_ENABLED or not os.path.isdir(LOG_DIR):
+        return []
+    try:
+        paths = [
+            os.path.join(LOG_DIR, name)
+            for name in os.listdir(LOG_DIR)
+            if name.startswith("usb_android_monitor-") and name.endswith(".jsonl")
+        ]
+    except OSError:
+        return []
+    lines: list[str] = []
+    for path in sorted(paths)[-3:]:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines.extend(handle.readlines())
+        except OSError:
+            continue
+    entries: list[dict[str, Any]] = []
+    for line in lines[-limit:]:
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
+    return list(reversed(entries))
 
 
 def run_action_async(action: str, serial: str) -> dict[str, Any]:
@@ -149,6 +227,7 @@ def run_action_async(action: str, serial: str) -> dict[str, Any]:
     }
     with ACTION_LOCK:
         ACTIVE_ACTIONS[action_id] = started
+    write_log("action_started", {"action": action, "serial": serial, "action_id": action_id})
 
     def worker() -> None:
         try:
@@ -268,7 +347,35 @@ def dashboard_diagnostics() -> list[dict[str, str]]:
 
 
 def run_command(args: list[str], timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+    started = time.perf_counter()
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        write_log(
+            "command_timeout",
+            {
+                "command": args,
+                "timeout_seconds": timeout,
+                "duration_ms": duration_ms,
+                "stdout": truncate_text(exc.stdout or ""),
+                "stderr": truncate_text(exc.stderr or ""),
+            },
+        )
+        raise
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    if result.returncode != 0 or duration_ms > 2000:
+        write_log(
+            "command_completed",
+            {
+                "command": args,
+                "returncode": result.returncode,
+                "duration_ms": duration_ms,
+                "stdout": truncate_text(result.stdout),
+                "stderr": truncate_text(result.stderr),
+            },
+        )
+    return result
 
 
 def run_json_command(args: list[str]) -> dict[str, Any]:
@@ -318,6 +425,13 @@ def save_state(state: dict[str, Any], path: str = STATE_PATH) -> None:
         json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
     os.replace(tmp_path, path)
+    write_log(
+        "state_saved",
+        {
+            "state_path": path,
+            "known_device_count": len(state.get("known_devices", {})) if isinstance(state.get("known_devices"), dict) else 0,
+        },
+    )
 
 
 def remember_known_device(serial: str, data: dict[str, Any]) -> None:
@@ -476,12 +590,23 @@ def infer_uhubctl_target_from_usb_path(usb_path: str) -> dict[str, str]:
 
 
 def get_adb_devices() -> list[AdbDevice]:
+    global LAST_ADB_RAW_OUTPUT
+
     if not shutil.which("adb"):
         return []
     result = run_command(["adb", "devices", "-l"], timeout=10)
     if result.returncode != 0:
         record_action("adb devices", False, result.stderr.strip() or result.stdout.strip())
         return []
+    if result.stdout != LAST_ADB_RAW_OUTPUT:
+        write_log(
+            "adb_snapshot_changed",
+            {
+                "raw": truncate_text(result.stdout),
+                "previous_raw": truncate_text(LAST_ADB_RAW_OUTPUT),
+            },
+        )
+        LAST_ADB_RAW_OUTPUT = result.stdout
     return parse_adb_devices(result.stdout)
 
 
@@ -911,6 +1036,7 @@ def acroname_no_error_value(brainstem: Any) -> Any:
 
 
 def run_acroname_port_action(serial: str, control: dict[str, Any], action: str) -> dict[str, Any]:
+    started = time.perf_counter()
     try:
         port = int(control["port"])
         hub_model = str(control.get("model") or "USBHub3c")
@@ -955,6 +1081,20 @@ def run_acroname_port_action(serial: str, control: dict[str, Any], action: str) 
             return record_action(f"acroname-port-{action}", False, f"unsupported Acroname action {action}", serial)
         ok = err == no_error
         message = f"Acroname {hub_model} port {port} {action}; result={err}"
+        write_log(
+            "hub_port_action_result",
+            {
+                "backend": "acroname",
+                "serial": serial,
+                "hub_model": hub_model,
+                "hub_serial": control.get("hub_serial") or control.get("serial_number") or "",
+                "port": port,
+                "action": action,
+                "ok": ok,
+                "result_code": str(err),
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            },
+        )
         return record_action(f"acroname-port-{action}", ok, message, serial)
     except Exception as exc:
         return record_action(f"acroname-port-{action}", False, f"Acroname control failed: {exc}", serial)
@@ -1006,12 +1146,22 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
 
     mapped: dict[str, int] = {}
     messages: list[str] = [f"baseline adb devices={len(baseline)}", f"ports={ports}"]
+    write_log(
+        "acroname_map_started",
+        {
+            "ports": ports,
+            "baseline_serials": sorted(baseline),
+            "hub_model": mapping_control.get("model", "USBHub3c"),
+            "hub_serial": mapping_control.get("hub_serial") or mapping_control.get("serial_number") or "",
+        },
+    )
     for port in ports:
         control = acroname_control_for_port(mapping_control, port)
         before = adb_serials()
         if not before:
             messages.append(f"port {port}: skipped because no ADB devices were visible")
             continue
+        write_log("acroname_map_port_probe_started", {"port": port, "before_serials": sorted(before)})
         off = run_acroname_port_action("", control, "off")
         if not off["ok"]:
             messages.append(f"port {port}: off failed: {off['message']}")
@@ -1029,6 +1179,17 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
         missing = wait_for_serials_absent(before)
         on = run_acroname_port_action("", control, "on")
         returned = wait_for_serials_present(missing) if missing else set()
+        write_log(
+            "acroname_map_port_probe_result",
+            {
+                "port": port,
+                "before_serials": sorted(before),
+                "missing_serials": sorted(missing),
+                "returned_serials": sorted(returned),
+                "off_ok": off["ok"],
+                "on_ok": on["ok"],
+            },
+        )
         if len(missing) > 1:
             return record_action(
                 "map-acroname",
@@ -1064,6 +1225,7 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
             messages.append(f"port {port}: no ADB serial disappeared")
         time.sleep(1.0)
     ok = bool(mapped)
+    write_log("acroname_map_completed", {"ok": ok, "mapped": mapped, "ports": ports})
     return record_action(
         "map-acroname",
         ok,
@@ -1455,9 +1617,12 @@ def snapshot() -> dict[str, Any]:
         "acroname_available": brainstem_available(),
         "auto_reconnect_enabled": AUTO_RECONNECT_ENABLED,
         "config_path": CONFIG_PATH,
+        "state_path": STATE_PATH,
+        "log_dir": LOG_DIR,
         "configured_device_count": len(configured_devices(config)),
         "active_actions": active_actions_snapshot(),
         "last_actions": last_actions_snapshot(),
+        "persistent_logs": recent_persistent_logs(120),
         "diagnostics": dashboard_diagnostics(),
         "summary": {
             "total_usb_devices": len(usb_devices),
@@ -1711,6 +1876,18 @@ INDEX_HTML = """<!doctype html>
     }
 
     function actionCard(action) {
+      if (action.event && !action.action) {
+        const status = action.status || (action.ok === false ? "failed" : "event");
+        const cls = status === "running" ? "running" : status === "failed" ? "failed" : "ready";
+        const title = action.event;
+        const serial = action.serial || action.target_serial || "all devices";
+        const message = action.message || action.raw || JSON.stringify(action);
+        return `<article class="device ${cls}">
+          <div class="name">${title}<span class="tag ${status}">${status}</span></div>
+          <div class="meta">${action.ts || action.timestamp || "-"} · ${serial}</div>
+          <div class="meta">${message}</div>
+        </article>`;
+      }
       const status = action.status || (action.ok ? "ok" : "failed");
       const cls = status === "running" ? "running" : action.ok ? "ready" : "failed";
       const spinner = status === "running" ? `<span class="spinner"></span>` : "";
@@ -1741,7 +1918,7 @@ INDEX_HTML = """<!doctype html>
       const state = await response.json();
       updatedEl.textContent = `Updated ${state.timestamp} · ${state.platform} · USB backend ${state.usb_backend} · ADB ${state.adb_available ? "available" : "not installed"}`;
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Configured devices: ${state.configured_device_count}. Config file: ${state.config_path}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Auto-map Acroname ports</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Config file: ${state.config_path}. Logs: ${state.log_dir}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Auto-map Acroname ports</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")
@@ -1767,6 +1944,8 @@ INDEX_HTML = """<!doctype html>
         : `<article class="device"><div class="name">No USB context available</div><div class="meta">Install lsusb on Ubuntu, or run on Windows with PowerShell available.</div></article>`;
       actionsEl.innerHTML = state.last_actions.length
         ? state.last_actions.map(actionCard).join("")
+        : state.persistent_logs && state.persistent_logs.length
+        ? state.persistent_logs.map(actionCard).join("")
         : `<article class="device"><div class="name">No actions yet</div></article>`;
     }
 
@@ -1826,6 +2005,19 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
 def serve(host: str, port: int) -> None:
     server = ThreadingHTTPServer((host, port), MonitorHandler)
+    write_log(
+        "service_started",
+        {
+            "host": host,
+            "port": port,
+            "config_path": CONFIG_PATH,
+            "state_path": STATE_PATH,
+            "log_dir": LOG_DIR,
+            "python": sys.version,
+            "adb_available": bool(shutil.which("adb")),
+            "brainstem_available": brainstem_available(),
+        },
+    )
     print(f"USB Android Monitor running at http://{host}:{port}")
     try:
         server.serve_forever()

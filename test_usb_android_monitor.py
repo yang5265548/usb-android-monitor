@@ -1,4 +1,5 @@
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import usb_android_monitor
@@ -16,9 +17,11 @@ from usb_android_monitor import (
     parse_acroname_serial,
     parse_adb_devices,
     record_adb_device_events,
+    recent_persistent_logs,
     recovery_plan_for_serial,
     snapshot,
     wait_for_adb_present,
+    write_log,
 )
 
 
@@ -29,6 +32,11 @@ class UsbAndroidMonitorTest(unittest.TestCase):
             usb_android_monitor.ACTIVE_ACTIONS.clear()
             usb_android_monitor.ADB_EVENT_STATE.clear()
             usb_android_monitor.ADB_EVENT_LOG_INITIALIZED = False
+            usb_android_monitor.LAST_ADB_RAW_OUTPUT = ""
+        usb_android_monitor.LOG_ENABLED = False
+
+    def tearDown(self) -> None:
+        usb_android_monitor.LOG_ENABLED = True
 
     def test_detects_android_phone_behind_hub(self) -> None:
         state = {
@@ -64,6 +72,20 @@ class UsbAndroidMonitorTest(unittest.TestCase):
         self.assertEqual(android[0].name, "Pixel 8")
         self.assertEqual(android[0].vendor_id, "0x18d1")
         self.assertEqual(android[0].parent_hubs, ["USB31Bus", "USB2.1 Hub"])
+
+    def test_persistent_logs_round_trip_jsonl(self) -> None:
+        with TemporaryDirectory() as log_dir:
+            old_dir = usb_android_monitor.LOG_DIR
+            usb_android_monitor.LOG_DIR = log_dir
+            usb_android_monitor.LOG_ENABLED = True
+            try:
+                write_log("unit_test_event", {"serial": "SERIAL1", "message": "hello"})
+                entries = recent_persistent_logs(10)
+            finally:
+                usb_android_monitor.LOG_DIR = old_dir
+
+        self.assertEqual(entries[0]["event"], "unit_test_event")
+        self.assertEqual(entries[0]["serial"], "SERIAL1")
 
     def test_non_android_usb_device_is_not_candidate(self) -> None:
         state = {

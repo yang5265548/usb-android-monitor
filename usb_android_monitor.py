@@ -1430,6 +1430,20 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
             "hub_serial": mapping_control.get("hub_serial") or mapping_control.get("serial_number") or "",
         },
     )
+
+    def remember_acroname_mapping(serial: str, control: dict[str, Any], power_state: str, status: str) -> None:
+        learned = dict(control)
+        learned["source"] = "auto-map"
+        remember_known_device(
+            serial,
+            {
+                "name": serial,
+                "acroname_control": learned,
+                "power_state": power_state,
+                "mapping_status": status,
+            },
+        )
+
     for port in ports:
         control = acroname_control_for_port(mapping_control, port)
         before = adb_serials()
@@ -1453,6 +1467,8 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
             continue
         missing = wait_for_serials_absent(before)
         on = run_acroname_port_action("", control, "on")
+        if missing and on["ok"]:
+            reconnect_device("")
         returned = wait_for_serials_present(missing) if missing else set()
         write_log(
             "acroname_map_port_probe_result",
@@ -1473,29 +1489,33 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
                 f"port={port}; disappeared={sorted(missing)}; on={on['message']}",
             )
         elif missing:
-            if not on["ok"] or returned != missing:
+            if not on["ok"]:
                 return record_action(
                     "map-acroname",
                     False,
-                    "aborted because the mapped device did not fully return after re-enabling the port; "
-                    f"port={port}; disappeared={sorted(missing)}; returned={sorted(returned)}; on={on['message']}",
+                    "aborted because the mapped port could not be re-enabled; "
+                    f"port={port}; disappeared={sorted(missing)}; on={on['message']}",
                 )
             for serial in sorted(missing):
-                learned = dict(control)
-                learned["source"] = "auto-map"
-                remember_known_device(
+                remember_acroname_mapping(
                     serial,
-                    {
-                        "name": serial,
-                        "acroname_control": learned,
-                        "power_state": "on" if serial in returned else "unknown",
-                    },
+                    control,
+                    "on" if serial in returned else "unknown",
+                    "mapped" if serial in returned else "mapped-needs-return",
                 )
                 mapped[serial] = port
             messages.append(
                 f"port {port}: mapped {', '.join(sorted(missing))}; "
                 f"return={'ok' if returned == missing else 'partial'}; on={on['status']}"
             )
+            if returned != missing:
+                return record_action(
+                    "map-acroname",
+                    False,
+                    "stopped after saving a partial mapping because the phone did not return to ADB in time; "
+                    f"port={port}; disappeared={sorted(missing)}; returned={sorted(returned)}; "
+                    "wait for the phone to reappear, then run Refresh Acroname port map again",
+                )
         else:
             messages.append(f"port {port}: no ADB serial disappeared")
         time.sleep(1.0)

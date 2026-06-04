@@ -396,6 +396,37 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertFalse(result["ok"])
         self.assertIn("multiple ADB serials", result["message"])
 
+    def test_acroname_map_saves_partial_mapping_when_phone_returns_slowly(self) -> None:
+        remembered: list[tuple[str, dict[str, object]]] = []
+
+        def remember(serial: str, data: dict[str, object]) -> None:
+            remembered.append((serial, data))
+
+        with (
+            patch("usb_android_monitor.load_config", return_value={"acroname": {"ports": [1]}, "devices": {}}),
+            patch("usb_android_monitor.adb_serials", return_value={"A", "B"}),
+            patch("usb_android_monitor.clear_learned_acroname_mappings", return_value=0),
+            patch("usb_android_monitor.wait_for_serials_absent", return_value={"A"}),
+            patch("usb_android_monitor.wait_for_serials_present", return_value=set()),
+            patch("usb_android_monitor.reconnect_device"),
+            patch("usb_android_monitor.remember_known_device", side_effect=remember),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                side_effect=[
+                    {"ok": True, "status": "ok", "message": "off ok"},
+                    {"ok": True, "status": "ok", "message": "on ok"},
+                ],
+            ),
+        ):
+            result = map_acroname_ports()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("partial mapping", result["message"])
+        self.assertEqual(remembered[0][0], "A")
+        self.assertEqual(remembered[0][1]["power_state"], "unknown")
+        self.assertEqual(remembered[0][1]["mapping_status"], "mapped-needs-return")
+        self.assertEqual(remembered[0][1]["acroname_control"]["port"], 1)
+
     def test_windows_acroname_without_mapping_does_not_use_android_fallback(self) -> None:
         with (
             patch("usb_android_monitor.load_config", return_value={"devices": {}}),

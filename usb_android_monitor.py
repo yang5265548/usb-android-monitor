@@ -1625,7 +1625,6 @@ def snapshot() -> dict[str, Any]:
         "configured_device_count": len(configured_devices(config)),
         "active_actions": active_actions_snapshot(),
         "last_actions": last_actions_snapshot(),
-        "persistent_logs": recent_persistent_logs(120),
         "diagnostics": dashboard_diagnostics(),
         "summary": {
             "total_usb_devices": len(usb_devices),
@@ -1947,9 +1946,7 @@ INDEX_HTML = """<!doctype html>
         : `<article class="device"><div class="name">No USB context available</div><div class="meta">Install lsusb on Ubuntu, or run on Windows with PowerShell available.</div></article>`;
       actionsEl.innerHTML = state.last_actions.length
         ? state.last_actions.map(actionCard).join("")
-        : state.persistent_logs && state.persistent_logs.length
-        ? state.persistent_logs.map(actionCard).join("")
-        : `<article class="device"><div class="name">No actions yet</div></article>`;
+        : `<article class="device"><div class="name">No actions yet in this service run</div><div class="meta">Persistent JSONL logs are still stored under ${state.log_dir} for offline analysis.</div></article>`;
     }
 
     function refreshLater(delayMs) {
@@ -2007,7 +2004,13 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int) -> None:
-    server = ThreadingHTTPServer((host, port), MonitorHandler)
+    try:
+        server = ThreadingHTTPServer((host, port), MonitorHandler)
+    except OSError as exc:
+        write_log("service_start_failed", {"host": host, "port": port, "error": str(exc)})
+        print(f"Could not start USB Android Monitor at http://{host}:{port}: {exc}", file=sys.stderr)
+        print("If the port is already in use, stop the old service or start with --port 8766.", file=sys.stderr)
+        raise SystemExit(1) from exc
     write_log(
         "service_started",
         {

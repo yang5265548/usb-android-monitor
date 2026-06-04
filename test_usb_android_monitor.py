@@ -330,6 +330,19 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(state["summary"]["configured_missing"], 0)
         self.assertEqual(state["missing_configured_devices"], [])
 
+    def test_snapshot_does_not_return_persistent_logs_to_recent_actions(self) -> None:
+        with (
+            patch("usb_android_monitor.load_config", return_value={"auto_recovery": {"enabled": False}, "devices": {}}),
+            patch("usb_android_monitor.get_usb_devices", return_value=([], "test-usb")),
+            patch("usb_android_monitor.get_adb_devices", return_value=[]),
+            patch("usb_android_monitor.known_devices_snapshot", return_value={}),
+            patch("usb_android_monitor.shutil.which", return_value="/usr/bin/adb"),
+        ):
+            state = snapshot()
+
+        self.assertEqual(state["last_actions"], [])
+        self.assertNotIn("persistent_logs", state)
+
     def test_wait_for_adb_present_polls_until_serial_returns(self) -> None:
         with (
             patch("usb_android_monitor.adb_state_for_serial", side_effect=["absent", "absent", "device"]),

@@ -37,6 +37,7 @@ class UsbAndroidMonitorTest(unittest.TestCase):
             usb_android_monitor.ADB_EVENT_LOG_INITIALIZED = False
             usb_android_monitor.LAST_ADB_RAW_OUTPUT = ""
             usb_android_monitor.EVENT_HISTORY.clear()
+            usb_android_monitor.MANUAL_DISCONNECT_UNTIL.clear()
         usb_android_monitor.LOG_ENABLED = False
 
     def tearDown(self) -> None:
@@ -344,6 +345,26 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertIn("Auto-map Acroname ports", result["message"])
         self.assertNotIn("setFunctions", result["message"])
 
+    def test_acroname_disconnect_keeps_powered_off_state_when_verified(self) -> None:
+        control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.acroname_control_for_serial", return_value=control),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                return_value={"ok": True, "status": "ok", "message": "Acroname USBHub3c port 5 off"},
+            ),
+            patch("usb_android_monitor.wait_for_adb_absent", return_value=(True, "absent")),
+            patch("usb_android_monitor.remember_known_device") as remember,
+        ):
+            result = disconnect_device("SERIAL1")
+
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(remember.call_count, 2)
+        self.assertEqual(remember.call_args.args[0], "SERIAL1")
+        self.assertEqual(remember.call_args.args[1]["power_state"], "off")
+        self.assertEqual(remember.call_args.args[1]["acroname_control"]["port"], 5)
+
     def test_configured_devices_rejects_non_dict(self) -> None:
         self.assertEqual(configured_devices({"devices": []}), {})
 
@@ -427,6 +448,31 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
 
         self.assertEqual(state["summary"]["configured_missing"], 0)
         self.assertEqual(state["missing_configured_devices"], [])
+
+    def test_snapshot_does_not_mark_manual_disconnect_back_online(self) -> None:
+        usb_android_monitor.MANUAL_DISCONNECT_UNTIL["SERIAL1"] = usb_android_monitor.time.time() + 60
+        android = [
+            {
+                "serial": "SERIAL1",
+                "state": "device",
+                "usb_path": "",
+                "transport_id": "9",
+                "behind_hub": False,
+                "needs_attention": False,
+            }
+        ]
+
+        with (
+            patch("usb_android_monitor.load_config", return_value={"auto_recovery": {"enabled": False}, "devices": {}}),
+            patch("usb_android_monitor.get_usb_devices", return_value=([], "test-usb")),
+            patch("usb_android_monitor.get_adb_devices", return_value=[]),
+            patch("usb_android_monitor.enrich_adb_with_usb", return_value=android),
+            patch("usb_android_monitor.forget_disconnected_target") as forget,
+            patch("usb_android_monitor.shutil.which", return_value="/usr/bin/adb"),
+        ):
+            snapshot()
+
+        forget.assert_not_called()
 
     def test_snapshot_does_not_return_persistent_logs_to_recent_actions(self) -> None:
         with (

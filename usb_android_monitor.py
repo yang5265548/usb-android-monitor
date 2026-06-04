@@ -1642,6 +1642,8 @@ def disconnect_device(serial: str) -> dict[str, Any]:
         remember_known_device(serial, {"acroname_control": dict(acroname), "power_state": "off"})
         result = run_acroname_port_action(serial, acroname, "off")
         verified, last_state = wait_for_adb_absent(serial)
+        if result["ok"] and verified:
+            remember_known_device(serial, {"acroname_control": dict(acroname), "power_state": "off"})
         return record_action(
             "disconnect",
             result["ok"] and verified,
@@ -1756,7 +1758,10 @@ def snapshot() -> dict[str, Any]:
         device["acroname_control"] = acroname_control_for_serial(device["serial"], config)
     usb_android = [device for device in usb_devices if device.is_android_candidate]
     current_serials = {device["serial"] for device in android_devices}
+    now = time.time()
     for serial in current_serials:
+        if now < MANUAL_DISCONNECT_UNTIL.get(serial, 0):
+            continue
         forget_disconnected_target(serial)
     known_devices = known_devices_snapshot()
     missing_configured = [

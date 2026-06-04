@@ -2211,7 +2211,9 @@ INDEX_HTML = """<!doctype html>
     .section-title { margin: 20px 0 9px; font-size: 16px; }
     .devices { display: grid; gap: 10px; }
     .device.ready { border-left: 5px solid #2fbf72; }
+    .device.auth { border-left: 5px solid #4da3ff; }
     .device.warn { border-left: 5px solid #d99432; }
+    .device.missing { border-left: 5px solid #d99432; }
     .device.failed { border-left: 5px solid #e05242; }
     .device.running { border-left: 5px solid #4da3ff; animation: pulseBorder 1.2s ease-in-out infinite; }
     .device.hub { border-left: 5px solid #7b8a96; }
@@ -2299,7 +2301,7 @@ INDEX_HTML = """<!doctype html>
 
     function androidCard(device, state) {
       const active = isSerialActive(state, device.serial);
-      const cls = active ? "running" : device.needs_attention ? "warn" : "ready";
+      const cls = active ? "running" : device.state === "unauthorized" ? "auth" : device.needs_attention ? "warn" : "ready";
       const hub = device.behind_hub ? "Behind hub" : "Hub unknown";
       const evidence = device.hub_evidence.length ? `<div class="meta">Hub evidence: ${device.hub_evidence.join("; ")}</div>` : "";
       const hubControl = device.acroname_control && device.acroname_control.port !== undefined
@@ -2334,7 +2336,7 @@ INDEX_HTML = """<!doctype html>
         : device.power_target && device.power_target.location
         ? `<div class="hint">Power target: uhubctl -l ${device.power_target.location} -p ${device.power_target.port} (${device.power_target.source})</div>`
         : `<div class="hint">No Hub power target is known for this missing device.</div>`;
-      return `<article class="device warn">
+      return `<article class="device missing">
         <div class="name">${device.name}<span class="tag">${device.serial}</span><span class="tag">${device.reason || "missing"}</span></div>
         <div class="meta">Recovery plan: ${device.recovery_plan.join(" -> ")}</div>
         ${target}

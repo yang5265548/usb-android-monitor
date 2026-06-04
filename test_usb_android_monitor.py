@@ -7,6 +7,7 @@ import usb_android_monitor
 from usb_android_monitor import (
     acroname_control_for_serial,
     acroname_mapping_control,
+    clear_learned_acroname_mappings,
     configured_devices,
     diagnose_disconnect,
     disconnect_device,
@@ -310,6 +311,38 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
     def test_acroname_mapping_defaults_skip_port_zero(self) -> None:
         self.assertEqual(acroname_mapping_control({})["ports"], [1, 2, 3, 4, 5])
 
+    def test_clear_learned_acroname_mappings_keeps_config_source(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            old_state = usb_android_monitor.STATE_PATH
+            usb_android_monitor.STATE_PATH = os.path.join(temp_dir, "state.json")
+            try:
+                usb_android_monitor.save_state(
+                    {
+                        "known_devices": {
+                            "AUTO": {
+                                "power_state": "off",
+                                "mapping_status": "suspect",
+                                "mapping_conflict_with": "OTHER",
+                                "acroname_control": {"port": 1, "source": "auto-map"},
+                            },
+                            "CONFIG": {
+                                "power_state": "off",
+                                "acroname_control": {"port": 2, "source": "config"},
+                            },
+                        }
+                    }
+                )
+                cleared = clear_learned_acroname_mappings()
+                state = usb_android_monitor.load_state()
+            finally:
+                usb_android_monitor.STATE_PATH = old_state
+
+        self.assertEqual(cleared, 1)
+        self.assertNotIn("acroname_control", state["known_devices"]["AUTO"])
+        self.assertNotIn("mapping_status", state["known_devices"]["AUTO"])
+        self.assertEqual(state["known_devices"]["AUTO"]["power_state"], "on")
+        self.assertEqual(state["known_devices"]["CONFIG"]["acroname_control"]["port"], 2)
+
     def test_normalized_acroname_ports_scans_zero_last(self) -> None:
         self.assertEqual(normalized_acroname_ports([0, 3, 1, 0]), [1, 3, 0])
 
@@ -329,6 +362,20 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
 
         self.assertFalse(result["ok"])
         self.assertIn("aborted", result["message"])
+
+    def test_acroname_map_clears_learned_mappings_before_probe(self) -> None:
+        with (
+            patch("usb_android_monitor.load_config", return_value={"acroname": {"ports": [1]}, "devices": {}}),
+            patch("usb_android_monitor.adb_serials", return_value={"A"}),
+            patch("usb_android_monitor.clear_learned_acroname_mappings", return_value=3) as clear,
+            patch("usb_android_monitor.run_acroname_port_action", return_value={"ok": True, "status": "ok", "message": "ok"}),
+            patch("usb_android_monitor.wait_for_serials_absent", return_value=set()),
+        ):
+            result = map_acroname_ports()
+
+        clear.assert_called_once()
+        self.assertFalse(result["ok"])
+        self.assertIn("cleared learned mappings=3", result["message"])
 
     def test_acroname_map_aborts_on_ambiguous_port(self) -> None:
         with (
@@ -359,7 +406,7 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
             result = disconnect_device("SERIAL1")
 
         self.assertFalse(result["ok"])
-        self.assertIn("Auto-map Acroname ports", result["message"])
+        self.assertIn("Refresh Acroname port map", result["message"])
         self.assertNotIn("setFunctions", result["message"])
 
     def test_acroname_disconnect_keeps_powered_off_state_when_verified(self) -> None:

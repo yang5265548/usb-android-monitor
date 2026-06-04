@@ -677,6 +677,32 @@ def known_devices_snapshot() -> dict[str, dict[str, Any]]:
         return dict(load_state().get("known_devices", {}))
 
 
+def clear_learned_acroname_mappings() -> int:
+    with ACTION_LOCK:
+        state = load_state()
+        known = state.setdefault("known_devices", {})
+        cleared = 0
+        for device in known.values():
+            if not isinstance(device, dict):
+                continue
+            control = device.get("acroname_control")
+            if not isinstance(control, dict):
+                continue
+            if control.get("source") == "config":
+                continue
+            device.pop("acroname_control", None)
+            device.pop("mapping_status", None)
+            device.pop("mapping_conflict_with", None)
+            if device.get("power_state") in {"off", "unknown"}:
+                device["power_state"] = "on"
+            cleared += 1
+        if cleared:
+            save_state(state)
+    if cleared:
+        write_log("acroname_mappings_cleared", {"cleared": cleared})
+    return cleared
+
+
 def split_vendor(raw: str) -> tuple[str, str]:
     if not raw:
         return "", ""
@@ -1386,14 +1412,20 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
     baseline = adb_serials()
     if not baseline:
         return record_action("map-acroname", False, "no ADB devices are currently visible; connect phones first")
+    cleared_mappings = clear_learned_acroname_mappings()
 
     mapped: dict[str, int] = {}
-    messages: list[str] = [f"baseline adb devices={len(baseline)}", f"ports={ports}"]
+    messages: list[str] = [
+        f"cleared learned mappings={cleared_mappings}",
+        f"baseline adb devices={len(baseline)}",
+        f"ports={ports}",
+    ]
     write_log(
         "acroname_map_started",
         {
             "ports": ports,
             "baseline_serials": sorted(baseline),
+            "cleared_mappings": cleared_mappings,
             "hub_model": mapping_control.get("model", "USBHub3c"),
             "hub_serial": mapping_control.get("hub_serial") or mapping_control.get("serial_number") or "",
         },
@@ -1722,7 +1754,7 @@ def disconnect_device(serial: str) -> dict[str, Any]:
         return record_action(
             "disconnect",
             False,
-            "No learned Acroname port mapping for this serial. Run Auto-map Acroname ports first; "
+            "No current Acroname port mapping for this serial. Run Refresh Acroname port map first; "
             "the Android-side USB disable fallback is not a reliable computer-side disconnect.",
             serial,
         )
@@ -2124,7 +2156,7 @@ INDEX_HTML = """<!doctype html>
         : device.uhubctl_target && device.uhubctl_target.location
         ? `<div class="hint">Hub control target: uhubctl -l ${device.uhubctl_target.location} -p ${device.uhubctl_target.port} (${device.uhubctl_target.source})</div>`
         : state.acroname_available
-        ? `<div class="hint">No Acroname port mapping learned yet. Run Auto-map Acroname ports before using Disconnect.</div>`
+        ? `<div class="hint">No current Acroname port mapping. Run Refresh Acroname port map after phones are replugged or moved.</div>`
         : `<div class="hint">No controllable Hub port inferred yet. Disconnect will fall back to Android-side USB data disable.</div>`;
       const disabled = active ? "disabled" : "";
       return `<article class="device ${cls}">
@@ -2218,7 +2250,7 @@ INDEX_HTML = """<!doctype html>
       const state = await response.json();
       updatedEl.textContent = `Updated ${state.timestamp} · ${state.platform} · USB backend ${state.usb_backend} · ADB ${state.adb_available ? "available" : "not installed"}`;
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Auto-map Acroname ports</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}.<div class="actions"><button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Refresh Acroname port map</button><button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")

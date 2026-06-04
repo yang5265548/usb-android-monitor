@@ -86,16 +86,19 @@ class UsbAndroidMonitorTest(unittest.TestCase):
                 write_log("unit_test_event", {"serial": "SERIAL1", "message": "hello"})
                 entries = recent_persistent_logs(10)
                 text_logs = [
-                    name
-                    for name in os.listdir(log_dir)
-                    if name.startswith("usb_android_monitor-") and name.endswith(".log")
+                    os.path.join(root, name)
+                    for root, _, names in os.walk(log_dir)
+                    for name in names
+                    if name.startswith("run-") and name.endswith(".log")
                 ]
                 json_logs = [
-                    name
-                    for name in os.listdir(log_dir)
-                    if name.startswith("usb_android_monitor-") and name.endswith(".jsonl")
+                    os.path.join(root, name)
+                    for root, _, names in os.walk(log_dir)
+                    for name in names
+                    if name.startswith("run-") and name.endswith(".jsonl")
                 ]
                 latest_jsonl_exists = os.path.exists(os.path.join(log_dir, "latest.jsonl"))
+                run_log_is_in_date_dir = os.path.basename(os.path.dirname(text_logs[0])).count("-") == 2
                 with open(os.path.join(log_dir, "latest.log"), "r", encoding="utf-8") as handle:
                     text_content = handle.read()
             finally:
@@ -107,6 +110,7 @@ class UsbAndroidMonitorTest(unittest.TestCase):
         self.assertEqual(len(text_logs), 1)
         self.assertEqual(len(json_logs), 1)
         self.assertTrue(latest_jsonl_exists)
+        self.assertTrue(run_log_is_in_date_dir)
         self.assertIn("unit_test_event", text_content)
         self.assertIn("serial=SERIAL1", text_content)
 

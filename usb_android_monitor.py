@@ -132,12 +132,12 @@ def now_iso() -> str:
 
 def log_file_path(timestamp: dt.datetime | None = None) -> str:
     stamp = timestamp or RUN_STARTED_AT
-    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}_{RUN_ID}.jsonl")
+    return os.path.join(LOG_DIR, f"{stamp:%Y-%m-%d}", f"run-{RUN_ID}.jsonl")
 
 
 def text_log_file_path(timestamp: dt.datetime | None = None) -> str:
     stamp = timestamp or RUN_STARTED_AT
-    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}_{RUN_ID}.log")
+    return os.path.join(LOG_DIR, f"{stamp:%Y-%m-%d}", f"run-{RUN_ID}.log")
 
 
 def latest_jsonl_log_path() -> str:
@@ -153,6 +153,7 @@ def initialize_latest_logs() -> None:
 
     if LATEST_LOGS_INITIALIZED:
         return
+    os.makedirs(LOG_DIR, exist_ok=True)
     for path in (latest_jsonl_log_path(), latest_text_log_path()):
         try:
             with open(path, "w", encoding="utf-8"):
@@ -241,6 +242,7 @@ def write_log(event: str, fields: dict[str, Any] | None = None) -> None:
     try:
         with LOG_LOCK:
             os.makedirs(LOG_DIR, exist_ok=True)
+            os.makedirs(os.path.dirname(log_file_path()), exist_ok=True)
             initialize_latest_logs()
             with open(log_file_path(), "a", encoding="utf-8") as handle:
                 json.dump(entry, handle, ensure_ascii=False, sort_keys=True)
@@ -262,11 +264,11 @@ def recent_persistent_logs(limit: int = 100) -> list[dict[str, Any]]:
     if not LOG_ENABLED or not os.path.isdir(LOG_DIR):
         return []
     try:
-        paths = [
-            os.path.join(LOG_DIR, name)
-            for name in os.listdir(LOG_DIR)
-            if name.startswith("usb_android_monitor-") and name.endswith(".jsonl")
-        ]
+        paths = []
+        for root, _, names in os.walk(LOG_DIR):
+            for name in names:
+                if name.startswith("run-") and name.endswith(".jsonl"):
+                    paths.append(os.path.join(root, name))
     except OSError:
         return []
     lines: list[str] = []

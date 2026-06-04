@@ -1415,6 +1415,7 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
     cleared_mappings = clear_learned_acroname_mappings()
 
     mapped: dict[str, int] = {}
+    partial_returns = 0
     messages: list[str] = [
         f"cleared learned mappings={cleared_mappings}",
         f"baseline adb devices={len(baseline)}",
@@ -1509,22 +1510,20 @@ def map_acroname_ports(_: str = "") -> dict[str, Any]:
                 f"return={'ok' if returned == missing else 'partial'}; on={on['status']}"
             )
             if returned != missing:
-                return record_action(
-                    "map-acroname",
-                    False,
-                    "stopped after saving a partial mapping because the phone did not return to ADB in time; "
-                    f"port={port}; disappeared={sorted(missing)}; returned={sorted(returned)}; "
-                    "wait for the phone to reappear, then run Refresh Acroname port map again",
+                partial_returns += 1
+                messages.append(
+                    f"port {port}: saved partial mapping; disappeared={sorted(missing)}; "
+                    f"returned={sorted(returned)}; continuing with visible devices"
                 )
         else:
             messages.append(f"port {port}: no ADB serial disappeared")
         time.sleep(1.0)
     ok = bool(mapped)
-    write_log("acroname_map_completed", {"ok": ok, "mapped": mapped, "ports": ports})
+    write_log("acroname_map_completed", {"ok": ok, "mapped": mapped, "ports": ports, "partial_returns": partial_returns})
     return record_action(
         "map-acroname",
         ok,
-        f"mapped {len(mapped)} device(s): {mapped}; " + " | ".join(messages),
+        f"mapped {len(mapped)} device(s): {mapped}; partial returns={partial_returns}; " + " | ".join(messages),
         status="ok" if ok else "failed",
     )
 

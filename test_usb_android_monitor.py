@@ -420,12 +420,46 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         ):
             result = map_acroname_ports()
 
-        self.assertFalse(result["ok"])
+        self.assertTrue(result["ok"])
         self.assertIn("partial mapping", result["message"])
+        self.assertIn("partial returns=1", result["message"])
         self.assertEqual(remembered[0][0], "A")
         self.assertEqual(remembered[0][1]["power_state"], "unknown")
         self.assertEqual(remembered[0][1]["mapping_status"], "mapped-needs-return")
         self.assertEqual(remembered[0][1]["acroname_control"]["port"], 1)
+
+    def test_acroname_map_continues_after_slow_return(self) -> None:
+        remembered: list[tuple[str, dict[str, object]]] = []
+
+        def remember(serial: str, data: dict[str, object]) -> None:
+            remembered.append((serial, data))
+
+        with (
+            patch("usb_android_monitor.load_config", return_value={"acroname": {"ports": [1, 2]}, "devices": {}}),
+            patch("usb_android_monitor.adb_serials", side_effect=[{"A", "B"}, {"A", "B"}, {"B"}]),
+            patch("usb_android_monitor.clear_learned_acroname_mappings", return_value=0),
+            patch("usb_android_monitor.wait_for_serials_absent", side_effect=[{"A"}, {"B"}]),
+            patch("usb_android_monitor.wait_for_serials_present", side_effect=[set(), {"B"}]),
+            patch("usb_android_monitor.reconnect_device"),
+            patch("usb_android_monitor.remember_known_device", side_effect=remember),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                side_effect=[
+                    {"ok": True, "status": "ok", "message": "port 1 off"},
+                    {"ok": True, "status": "ok", "message": "port 1 on"},
+                    {"ok": True, "status": "ok", "message": "port 2 off"},
+                    {"ok": True, "status": "ok", "message": "port 2 on"},
+                ],
+            ),
+            patch("usb_android_monitor.time.sleep"),
+        ):
+            result = map_acroname_ports()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([item[0] for item in remembered], ["A", "B"])
+        self.assertEqual(remembered[0][1]["mapping_status"], "mapped-needs-return")
+        self.assertEqual(remembered[1][1]["mapping_status"], "mapped")
+        self.assertIn("partial returns=1", result["message"])
 
     def test_windows_acroname_without_mapping_does_not_use_android_fallback(self) -> None:
         with (

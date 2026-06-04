@@ -1715,7 +1715,7 @@ def disconnect_device(serial: str) -> dict[str, Any]:
         missing_serials, current_serials = wait_for_serials_missing_from_baseline(before_serials)
         verified = serial in missing_serials or (serial in before_serials and serial not in current_serials)
         last_state = "absent" if verified else adb_state_for_serial(serial)
-        if result["ok"] and missing_serials and not verified:
+        if missing_serials and not verified:
             for missing_serial in sorted(missing_serials):
                 remember_known_device(
                     missing_serial,
@@ -1750,9 +1750,24 @@ def disconnect_device(serial: str) -> dict[str, Any]:
                     ),
                 },
             )
-        elif result["ok"] and verified:
+        elif verified:
             remember_known_device(serial, {"acroname_control": dict(acroname), "power_state": "off"})
-        elif result["ok"]:
+            if not result["ok"]:
+                write_log(
+                    "hub_port_effective_disconnect",
+                    {
+                        "backend": "acroname",
+                        "serial": serial,
+                        "port": acroname.get("port"),
+                        "hub_model": acroname.get("model", "USBHub3c"),
+                        "hub_serial": acroname.get("hub_serial") or acroname.get("serial_number") or "",
+                        "result_ok": result["ok"],
+                        "message": (
+                            "Acroname reported a port action error, but ADB verified the target serial disappeared"
+                        ),
+                    },
+                )
+        else:
             remember_known_device(
                 serial,
                 {
@@ -1763,10 +1778,11 @@ def disconnect_device(serial: str) -> dict[str, Any]:
             )
         return record_action(
             "disconnect",
-            result["ok"] and verified,
+            verified,
             "Acroname port disable requested; adb verification="
             f"{'absent' if verified else 'still ' + last_state}; "
-            f"adb disappeared={sorted(missing_serials)}; {result['message']}",
+            f"adb disappeared={sorted(missing_serials)}; {result['message']}"
+            f"{'; warning: hub API reported failure but ADB verified disconnect' if verified and not result['ok'] else ''}",
             serial,
         )
     if platform.system().lower() == "windows" and brainstem_available():

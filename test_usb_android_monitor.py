@@ -493,6 +493,26 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(remember.call_args.args[1]["power_state"], "off")
         self.assertEqual(remember.call_args.args[1]["acroname_control"]["port"], 5)
 
+    def test_acroname_disconnect_trusts_adb_when_hub_reports_error(self) -> None:
+        control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.acroname_control_for_serial", return_value=control),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                return_value={"ok": False, "status": "failed", "message": "Acroname USBHub3c port 5 off; result=18"},
+            ),
+            patch("usb_android_monitor.adb_serials", side_effect=[{"SERIAL1"}, set()]),
+            patch("usb_android_monitor.remember_known_device") as remember,
+        ):
+            result = disconnect_device("SERIAL1")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("warning: hub API reported failure", result["message"])
+        self.assertEqual(remember.call_args.args[0], "SERIAL1")
+        self.assertEqual(remember.call_args.args[1]["power_state"], "off")
+        self.assertEqual(remember.call_args.args[1]["acroname_control"]["port"], 5)
+
     def test_acroname_disconnect_records_mapping_conflict_for_actual_missing_serial(self) -> None:
         control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}
         remembered: list[tuple[str, dict[str, object]]] = []

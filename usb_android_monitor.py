@@ -220,6 +220,8 @@ def format_text_log(entry: dict[str, Any]) -> str:
         "reason",
         "confidence",
         "affected_serials",
+        "requested_serial",
+        "disappeared_serials",
     ):
         if key in entry and entry[key] is not None and entry[key] != "":
             parts.append(f"{key}={compact_log_value(entry[key])}")
@@ -1175,6 +1177,8 @@ def acroname_control_for_serial(serial: str, config: dict[str, Any]) -> dict[str
         configured.setdefault("source", "config")
         return configured
     known = known_devices_snapshot().get(serial, {})
+    if known.get("mapping_status") == "suspect":
+        return {}
     known_control = known.get("acroname_control", {})
     if isinstance(known_control, dict) and known_control.get("port") is not None:
         control = dict(known_control)
@@ -1343,6 +1347,22 @@ def wait_for_serials_absent(serials: set[str], timeout_seconds: float = 8.0) -> 
             return missing
         time.sleep(0.5)
     return missing
+
+
+def wait_for_serials_missing_from_baseline(
+    baseline: set[str],
+    timeout_seconds: float = 6.0,
+) -> tuple[set[str], set[str]]:
+    deadline = time.time() + timeout_seconds
+    current = set(baseline)
+    missing: set[str] = set()
+    while time.time() < deadline:
+        current = adb_serials()
+        missing = baseline - current
+        if missing:
+            return missing, current
+        time.sleep(0.5)
+    return missing, current
 
 
 def wait_for_serials_present(serials: set[str], timeout_seconds: float = 25.0) -> set[str]:
@@ -1639,16 +1659,63 @@ def disconnect_device(serial: str) -> dict[str, Any]:
     config = load_config()
     acroname = acroname_control_for_serial(serial, config)
     if acroname:
-        remember_known_device(serial, {"acroname_control": dict(acroname), "power_state": "off"})
+        before_serials = adb_serials()
         result = run_acroname_port_action(serial, acroname, "off")
-        verified, last_state = wait_for_adb_absent(serial)
-        if result["ok"] and verified:
+        missing_serials, current_serials = wait_for_serials_missing_from_baseline(before_serials)
+        verified = serial in missing_serials or (serial in before_serials and serial not in current_serials)
+        last_state = "absent" if verified else adb_state_for_serial(serial)
+        if result["ok"] and missing_serials and not verified:
+            for missing_serial in sorted(missing_serials):
+                remember_known_device(
+                    missing_serial,
+                    {
+                        "acroname_control": dict(acroname),
+                        "power_state": "off",
+                        "mapping_status": "learned-from-conflict",
+                        "mapping_conflict_with": serial,
+                    },
+                )
+            remember_known_device(
+                serial,
+                {
+                    "acroname_control": dict(acroname),
+                    "power_state": "on",
+                    "mapping_status": "suspect",
+                },
+            )
+            write_log(
+                "acroname_mapping_conflict",
+                {
+                    "serial": serial,
+                    "port": acroname.get("port"),
+                    "hub_model": acroname.get("model", "USBHub3c"),
+                    "hub_serial": acroname.get("hub_serial") or acroname.get("serial_number") or "",
+                    "requested_serial": serial,
+                    "disappeared_serials": sorted(missing_serials),
+                    "current_serials": sorted(current_serials),
+                    "message": (
+                        "Acroname port action affected different ADB serial(s); "
+                        "the stored serial-to-port mapping is stale or wrong"
+                    ),
+                },
+            )
+        elif result["ok"] and verified:
             remember_known_device(serial, {"acroname_control": dict(acroname), "power_state": "off"})
+        elif result["ok"]:
+            remember_known_device(
+                serial,
+                {
+                    "acroname_control": dict(acroname),
+                    "power_state": "on",
+                    "mapping_status": "suspect",
+                },
+            )
         return record_action(
             "disconnect",
             result["ok"] and verified,
             "Acroname port disable requested; adb verification="
-            f"{'absent' if verified else 'still ' + last_state}; {result['message']}",
+            f"{'absent' if verified else 'still ' + last_state}; "
+            f"adb disappeared={sorted(missing_serials)}; {result['message']}",
             serial,
         )
     if platform.system().lower() == "windows" and brainstem_available():

@@ -290,6 +290,23 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(control["port"], 4)
         self.assertEqual(control["source"], "state")
 
+    def test_acroname_control_for_serial_ignores_suspect_state_mapping(self) -> None:
+        known = {
+            "SERIAL1": {
+                "mapping_status": "suspect",
+                "acroname_control": {
+                    "model": "USBHub3c",
+                    "hub_serial": "0xC194E2FB",
+                    "port": 4,
+                },
+            }
+        }
+
+        with patch("usb_android_monitor.known_devices_snapshot", return_value=known):
+            control = acroname_control_for_serial("SERIAL1", {"devices": {}})
+
+        self.assertEqual(control, {})
+
     def test_acroname_mapping_defaults_skip_port_zero(self) -> None:
         self.assertEqual(acroname_mapping_control({})["ports"], [1, 2, 3, 4, 5])
 
@@ -354,16 +371,47 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
                 "usb_android_monitor.run_acroname_port_action",
                 return_value={"ok": True, "status": "ok", "message": "Acroname USBHub3c port 5 off"},
             ),
-            patch("usb_android_monitor.wait_for_adb_absent", return_value=(True, "absent")),
+            patch("usb_android_monitor.adb_serials", side_effect=[{"SERIAL1"}, set()]),
             patch("usb_android_monitor.remember_known_device") as remember,
         ):
             result = disconnect_device("SERIAL1")
 
         self.assertTrue(result["ok"])
-        self.assertGreaterEqual(remember.call_count, 2)
         self.assertEqual(remember.call_args.args[0], "SERIAL1")
         self.assertEqual(remember.call_args.args[1]["power_state"], "off")
         self.assertEqual(remember.call_args.args[1]["acroname_control"]["port"], 5)
+
+    def test_acroname_disconnect_records_mapping_conflict_for_actual_missing_serial(self) -> None:
+        control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}
+        remembered: list[tuple[str, dict[str, object]]] = []
+
+        def remember(serial: str, data: dict[str, object]) -> None:
+            remembered.append((serial, data))
+
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.acroname_control_for_serial", return_value=control),
+            patch(
+                "usb_android_monitor.run_acroname_port_action",
+                return_value={"ok": True, "status": "ok", "message": "Acroname USBHub3c port 5 off"},
+            ),
+            patch("usb_android_monitor.adb_serials", side_effect=[{"SERIAL1", "SERIAL2"}, {"SERIAL1"}]),
+            patch("usb_android_monitor.adb_state_for_serial", return_value="device"),
+            patch("usb_android_monitor.remember_known_device", side_effect=remember),
+        ):
+            result = disconnect_device("SERIAL1")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("adb disappeared=['SERIAL2']", result["message"])
+        self.assertIn(("SERIAL2", {
+            "acroname_control": control,
+            "power_state": "off",
+            "mapping_status": "learned-from-conflict",
+            "mapping_conflict_with": "SERIAL1",
+        }), remembered)
+        self.assertEqual(remembered[-1][0], "SERIAL1")
+        self.assertEqual(remembered[-1][1]["power_state"], "on")
+        self.assertEqual(remembered[-1][1]["mapping_status"], "suspect")
 
     def test_configured_devices_rejects_non_dict(self) -> None:
         self.assertEqual(configured_devices({"devices": []}), {})

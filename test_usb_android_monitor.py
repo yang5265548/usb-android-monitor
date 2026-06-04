@@ -305,6 +305,31 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(state["missing_configured_devices"][0]["power_target"]["port"], 2)
         self.assertIn("acroname on port=2", state["missing_configured_devices"][0]["recovery_plan"])
 
+    def test_snapshot_does_not_list_known_online_device_as_missing_after_restart(self) -> None:
+        known = {
+            "SERIAL1": {
+                "name": "Rack phone 1",
+                "power_state": "on",
+                "uhubctl_target": {
+                    "location": "2-2",
+                    "port": "3",
+                    "source": "state",
+                },
+            }
+        }
+
+        with (
+            patch("usb_android_monitor.load_config", return_value={"auto_recovery": {"enabled": False}, "devices": {}}),
+            patch("usb_android_monitor.get_usb_devices", return_value=([], "test-usb")),
+            patch("usb_android_monitor.get_adb_devices", return_value=[]),
+            patch("usb_android_monitor.known_devices_snapshot", return_value=known),
+            patch("usb_android_monitor.shutil.which", return_value="/usr/bin/adb"),
+        ):
+            state = snapshot()
+
+        self.assertEqual(state["summary"]["configured_missing"], 0)
+        self.assertEqual(state["missing_configured_devices"], [])
+
     def test_wait_for_adb_present_polls_until_serial_returns(self) -> None:
         with (
             patch("usb_android_monitor.adb_state_for_serial", side_effect=["absent", "absent", "device"]),

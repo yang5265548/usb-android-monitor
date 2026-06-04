@@ -1553,6 +1553,9 @@ def snapshot() -> dict[str, Any]:
             continue
         if any(device["serial"] == serial for device in missing_configured):
             continue
+        power_state = str(known.get("power_state") or "")
+        if power_state == "on":
+            continue
         target = known.get("acroname_control", {})
         if target.get("port") is not None:
             missing_configured.append(
@@ -1565,7 +1568,7 @@ def snapshot() -> dict[str, Any]:
                     ],
                     "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
                     "power_target": target,
-                    "reason": str(known.get("power_state") or "known-missing"),
+                    "reason": power_state or "known-missing",
                 }
             )
             continue
@@ -1582,7 +1585,7 @@ def snapshot() -> dict[str, Any]:
                 ],
                 "last_attempt_at": AUTO_RECONNECT_ATTEMPTS.get(serial, 0),
                 "power_target": target,
-                "reason": str(known.get("power_state") or "known-missing"),
+                "reason": power_state or "known-missing",
             }
         )
     with ACTION_LOCK:

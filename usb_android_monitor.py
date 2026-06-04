@@ -132,6 +132,11 @@ def log_file_path(timestamp: dt.datetime | None = None) -> str:
     return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}.jsonl")
 
 
+def text_log_file_path(timestamp: dt.datetime | None = None) -> str:
+    stamp = timestamp or dt.datetime.now().astimezone()
+    return os.path.join(LOG_DIR, f"usb_android_monitor-{stamp:%Y-%m-%d}.log")
+
+
 def truncate_text(value: Any, limit: int = COMMAND_LOG_OUTPUT_LIMIT) -> str:
     if value is None:
         text = ""
@@ -142,6 +147,58 @@ def truncate_text(value: Any, limit: int = COMMAND_LOG_OUTPUT_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"...<truncated {len(text) - limit} chars>"
+
+
+def log_level_for(entry: dict[str, Any]) -> str:
+    event = str(entry.get("event") or "")
+    if entry.get("ok") is False or "failed" in event or "timeout" in event or "aborted" in str(entry.get("message", "")):
+        return "ERROR"
+    if entry.get("status") == "failed":
+        return "ERROR"
+    if event.endswith("_started") or entry.get("status") == "running":
+        return "INFO"
+    if "changed" in event or entry.get("status") == "event":
+        return "EVENT"
+    return "INFO"
+
+
+def compact_log_value(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return "[" + ",".join(str(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{key}:{value[key]}" for key in sorted(value)) + "}"
+    return str(value)
+
+
+def format_text_log(entry: dict[str, Any]) -> str:
+    event = str(entry.get("event") or "-")
+    level = log_level_for(entry)
+    parts = [
+        f"{entry.get('ts', '-')}",
+        f"{level:<5}",
+        event,
+    ]
+    for key in (
+        "action",
+        "serial",
+        "target_serial",
+        "backend",
+        "hub_model",
+        "hub_serial",
+        "port",
+        "ok",
+        "status",
+        "result_code",
+        "duration_ms",
+    ):
+        if key in entry and entry[key] not in {None, ""}:
+            parts.append(f"{key}={compact_log_value(entry[key])}")
+    message = entry.get("message")
+    if message:
+        parts.append(f"message={truncate_text(message, 800)}")
+    elif event == "adb_snapshot_changed":
+        parts.append("message=ADB device list changed")
+    return " | ".join(parts)
 
 
 def write_log(event: str, fields: dict[str, Any] | None = None) -> None:
@@ -160,6 +217,9 @@ def write_log(event: str, fields: dict[str, Any] | None = None) -> None:
             os.makedirs(LOG_DIR, exist_ok=True)
             with open(log_file_path(), "a", encoding="utf-8") as handle:
                 json.dump(entry, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+            with open(text_log_file_path(), "a", encoding="utf-8") as handle:
+                handle.write(format_text_log(entry))
                 handle.write("\n")
     except OSError:
         pass
@@ -1946,7 +2006,7 @@ INDEX_HTML = """<!doctype html>
         : `<article class="device"><div class="name">No USB context available</div><div class="meta">Install lsusb on Ubuntu, or run on Windows with PowerShell available.</div></article>`;
       actionsEl.innerHTML = state.last_actions.length
         ? state.last_actions.map(actionCard).join("")
-        : `<article class="device"><div class="name">No actions yet in this service run</div><div class="meta">Persistent JSONL logs are still stored under ${state.log_dir} for offline analysis.</div></article>`;
+        : `<article class="device"><div class="name">No actions yet in this service run</div><div class="meta">Readable .log and structured .jsonl files are stored under ${state.log_dir}.</div></article>`;
     }
 
     function refreshLater(delayMs) {

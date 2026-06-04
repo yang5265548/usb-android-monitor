@@ -1,3 +1,4 @@
+import os
 import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -8,6 +9,7 @@ from usb_android_monitor import (
     acroname_mapping_control,
     configured_devices,
     disconnect_device,
+    format_text_log,
     flatten_usb_tree,
     hub_evidence_from_adb_usb_path,
     infer_uhubctl_target_from_usb_path,
@@ -81,11 +83,39 @@ class UsbAndroidMonitorTest(unittest.TestCase):
             try:
                 write_log("unit_test_event", {"serial": "SERIAL1", "message": "hello"})
                 entries = recent_persistent_logs(10)
+                text_logs = [name for name in os.listdir(log_dir) if name.endswith(".log")]
+                json_logs = [name for name in os.listdir(log_dir) if name.endswith(".jsonl")]
+                with open(os.path.join(log_dir, text_logs[0]), "r", encoding="utf-8") as handle:
+                    text_content = handle.read()
             finally:
                 usb_android_monitor.LOG_DIR = old_dir
 
         self.assertEqual(entries[0]["event"], "unit_test_event")
         self.assertEqual(entries[0]["serial"], "SERIAL1")
+        self.assertEqual(len(text_logs), 1)
+        self.assertEqual(len(json_logs), 1)
+        self.assertIn("unit_test_event", text_content)
+        self.assertIn("serial=SERIAL1", text_content)
+
+    def test_format_text_log_is_readable(self) -> None:
+        line = format_text_log(
+            {
+                "ts": "2026-06-04T10:00:00+03:00",
+                "event": "hub_port_action_result",
+                "backend": "acroname",
+                "serial": "SERIAL1",
+                "port": 2,
+                "ok": False,
+                "result_code": 18,
+                "message": "port off failed",
+            }
+        )
+
+        self.assertIn("ERROR", line)
+        self.assertIn("hub_port_action_result", line)
+        self.assertIn("backend=acroname", line)
+        self.assertIn("port=2", line)
+        self.assertIn("message=port off failed", line)
 
     def test_non_android_usb_device_is_not_candidate(self) -> None:
         state = {

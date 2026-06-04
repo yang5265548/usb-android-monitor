@@ -1643,7 +1643,34 @@ def connect_device(serial: str) -> dict[str, Any]:
     config = load_config()
     messages: list[str] = []
     ok = False
+    system = platform.system().lower()
     acroname = acroname_control_for_serial(serial, config)
+    if system == "linux" and (not acroname or not brainstem_available()):
+        uhubctl_target = uhubctl_target_for_serial(serial, config)
+        if uhubctl_target:
+            result = power_on_linux_hub_port(serial, uhubctl_target)
+            messages.append(
+                f"hub port power on via {uhubctl_target.get('source', '-')}: {result['message']}"
+            )
+            ok = result["ok"]
+            if ok:
+                MANUAL_DISCONNECT_UNTIL.pop(serial, None)
+                messages.append(reconnect_device(serial)["message"])
+                present, state = wait_for_adb_present(serial)
+                if present:
+                    forget_disconnected_target(serial)
+                    return record_action(
+                        "connect",
+                        True,
+                        f"{' | '.join(messages)} | adb returned within wait window; state={state}",
+                        serial,
+                    )
+                return record_action(
+                    "connect",
+                    False,
+                    f"{' | '.join(messages)} | hub port is on, but serial stayed absent from adb after 25s",
+                    serial,
+                )
     if acroname:
         result = run_acroname_port_action(serial, acroname, "on")
         messages.append(f"acroname port power/data on: {result['message']}")
@@ -1690,7 +1717,7 @@ def connect_device(serial: str) -> dict[str, Any]:
                 f"{' | '.join(messages)} | Acroname port is on, but serial stayed absent from adb after retry",
                 serial,
             )
-    elif platform.system().lower() == "linux":
+    elif system == "linux":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:
             result = power_on_linux_hub_port(serial, uhubctl_target)
@@ -1732,7 +1759,22 @@ def disconnect_device(serial: str) -> dict[str, Any]:
     MANUAL_DISCONNECT_UNTIL[serial] = time.time() + 120
 
     config = load_config()
+    system = platform.system().lower()
     acroname = acroname_control_for_serial(serial, config)
+    if system == "linux" and (not acroname or not brainstem_available()):
+        uhubctl_target = uhubctl_target_for_serial(serial, config)
+        if uhubctl_target:
+            remember_disconnected_target(serial, uhubctl_target)
+            result = power_off_linux_hub_port(serial, uhubctl_target)
+            verified, last_state = wait_for_adb_absent(serial)
+            return record_action(
+                "disconnect",
+                result["ok"] and verified,
+                "hub port power off requested "
+                f"via {uhubctl_target.get('source', '-')}; adb verification="
+                f"{'absent' if verified else 'still ' + last_state}; {result['message']}",
+                serial,
+            )
     if acroname:
         before_serials = adb_serials()
         result = run_acroname_port_action(serial, acroname, "off")
@@ -1809,7 +1851,7 @@ def disconnect_device(serial: str) -> dict[str, Any]:
             f"{'; warning: hub API reported failure but ADB verified disconnect' if verified and not result['ok'] else ''}",
             serial,
         )
-    if platform.system().lower() == "windows" and brainstem_available():
+    if system == "windows" and brainstem_available():
         return record_action(
             "disconnect",
             False,
@@ -1817,7 +1859,7 @@ def disconnect_device(serial: str) -> dict[str, Any]:
             "the Android-side USB disable fallback is not a reliable computer-side disconnect.",
             serial,
         )
-    if platform.system().lower() == "linux":
+    if system == "linux":
         uhubctl_target = uhubctl_target_for_serial(serial, config)
         if uhubctl_target:
             remember_disconnected_target(serial, uhubctl_target)

@@ -525,6 +525,28 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertIn("adb returned after retry cycle", result["message"])
         forget.assert_called_once_with("SERIAL1")
 
+    def test_linux_connect_prefers_uhubctl_when_acroname_state_is_stale(self) -> None:
+        stale_acroname = {"type": "acroname", "model": "USBHub3c", "port": 5}
+        uhubctl = {"location": "2-2", "port": "3", "source": "state"}
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.platform.system", return_value="Linux"),
+            patch("usb_android_monitor.brainstem_available", return_value=False),
+            patch("usb_android_monitor.acroname_control_for_serial", return_value=stale_acroname),
+            patch("usb_android_monitor.uhubctl_target_for_serial", return_value=uhubctl),
+            patch("usb_android_monitor.power_on_linux_hub_port", return_value={"ok": True, "message": "uhubctl on ok"}),
+            patch("usb_android_monitor.run_acroname_port_action") as acroname_action,
+            patch("usb_android_monitor.reconnect_device", return_value={"ok": True, "message": "reconnect"}),
+            patch("usb_android_monitor.wait_for_adb_present", return_value=(True, "device")),
+            patch("usb_android_monitor.forget_disconnected_target") as forget,
+        ):
+            result = connect_device("SERIAL1")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("hub port power on via state", result["message"])
+        acroname_action.assert_not_called()
+        forget.assert_called_once_with("SERIAL1")
+
     def test_acroname_disconnect_keeps_powered_off_state_when_verified(self) -> None:
         control = {"type": "acroname", "model": "USBHub3c", "hub_serial": "0xC194E2FB", "port": 5}
         with (
@@ -595,6 +617,26 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(remembered[-1][0], "SERIAL1")
         self.assertEqual(remembered[-1][1]["power_state"], "on")
         self.assertEqual(remembered[-1][1]["mapping_status"], "suspect")
+
+    def test_linux_disconnect_prefers_uhubctl_when_acroname_state_is_stale(self) -> None:
+        stale_acroname = {"type": "acroname", "model": "USBHub3c", "port": 5}
+        uhubctl = {"location": "2-2", "port": "3", "source": "state"}
+        with (
+            patch("usb_android_monitor.load_config", return_value={"devices": {}}),
+            patch("usb_android_monitor.platform.system", return_value="Linux"),
+            patch("usb_android_monitor.brainstem_available", return_value=False),
+            patch("usb_android_monitor.acroname_control_for_serial", return_value=stale_acroname),
+            patch("usb_android_monitor.uhubctl_target_for_serial", return_value=uhubctl),
+            patch("usb_android_monitor.remember_disconnected_target"),
+            patch("usb_android_monitor.power_off_linux_hub_port", return_value={"ok": True, "message": "uhubctl off ok"}),
+            patch("usb_android_monitor.run_acroname_port_action") as acroname_action,
+            patch("usb_android_monitor.wait_for_adb_absent", return_value=(True, "absent")),
+        ):
+            result = disconnect_device("SERIAL1")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("hub port power off requested via state", result["message"])
+        acroname_action.assert_not_called()
 
     def test_configured_devices_rejects_non_dict(self) -> None:
         self.assertEqual(configured_devices({"devices": []}), {})

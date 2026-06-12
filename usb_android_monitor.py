@@ -493,13 +493,16 @@ def mirror_process_running() -> bool:
 
 
 def mirror_status_snapshot() -> dict[str, Any]:
+    config = load_config()
+    script_path = configured_mirror_script_path(config)
     with MIRROR_LOCK:
         running = MIRROR_PROCESS is not None and MIRROR_PROCESS.poll() is None
         return {
-            "enabled": bool(configured_mirror_script_path(load_config())),
+            "configured": bool(script_path),
             "running": running,
             "pid": MIRROR_PROCESS.pid if running and MIRROR_PROCESS is not None else None,
-            "script_path": configured_mirror_script_path(load_config()),
+            "script_path": script_path,
+            "supported": platform.system().lower() == "windows",
         }
 
 
@@ -2496,11 +2499,15 @@ INDEX_HTML = """<!doctype html>
       const mapButton = state.hub_backend === "acroname"
         ? `<button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Refresh Acroname port map</button>`
         : "";
-      const mirrorButton = state.mirror_status && state.mirror_status.enabled
-        ? `<button class="primary" data-action="start-mirror-script" data-serial="" ${state.mirror_status.running ? "disabled" : ""} onclick="doAction('start-mirror-script')">${state.mirror_status.running ? "Mirror script running" : "Start mirror script"}</button>`
-        : "";
+      const mirrorButton = state.mirror_status.running
+        ? `<button class="primary" data-action="start-mirror-script" data-serial="" disabled>Mirror script running</button>`
+        : state.mirror_status.configured && state.mirror_status.supported
+        ? `<button class="primary" data-action="start-mirror-script" data-serial="" onclick="doAction('start-mirror-script')">Start mirror script</button>`
+        : state.mirror_status.configured
+        ? `<button data-action="start-mirror-script" data-serial="" disabled>Mirror script Windows only</button>`
+        : `<button data-action="start-mirror-script" data-serial="" disabled>Mirror script not configured</button>`;
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror script: ${state.mirror_status.script_path || "-"}.<div class="actions">${mapButton}${mirrorButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror script: ${state.mirror_status.script_path || "not configured"}.<div class="actions">${mapButton}${mirrorButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")

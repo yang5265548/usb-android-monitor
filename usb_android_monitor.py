@@ -547,7 +547,28 @@ def configured_scrcpy_dir(config: dict[str, Any]) -> str:
     mirror_config = config.get("mirror", {})
     if isinstance(mirror_config, dict) and mirror_config.get("scrcpy_dir"):
         return str(mirror_config["scrcpy_dir"])
+    state = load_state()
+    state_mirror_config = state.get("mirror", {})
+    if isinstance(state_mirror_config, dict) and state_mirror_config.get("scrcpy_dir"):
+        return str(state_mirror_config["scrcpy_dir"])
     return MIRROR_SCRCPY_DIR
+
+
+def remember_mirror_scrcpy_dir(scrcpy_dir: str) -> dict[str, Any]:
+    scrcpy_dir = scrcpy_dir.strip().strip('"')
+    if not scrcpy_dir:
+        return {"ok": False, "message": "scrcpy directory is empty"}
+    with ACTION_LOCK:
+        state = load_state()
+        mirror_config = state.setdefault("mirror", {})
+        if not isinstance(mirror_config, dict):
+            mirror_config = {}
+            state["mirror"] = mirror_config
+        mirror_config["scrcpy_dir"] = scrcpy_dir
+        mirror_config["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_state(state)
+    write_log("mirror_scrcpy_dir_saved", {"scrcpy_dir": scrcpy_dir})
+    return {"ok": True, "message": "mirror scrcpy directory saved", "scrcpy_dir": scrcpy_dir}
 
 
 def mirror_process_running() -> bool:
@@ -559,6 +580,8 @@ def mirror_status_snapshot() -> dict[str, Any]:
     config = load_config()
     script_path = configured_mirror_script_path(config)
     scrcpy_dir = configured_scrcpy_dir(config)
+    scrcpy_exe = os.path.join(scrcpy_dir, "scrcpy.exe")
+    adb_exe = os.path.join(scrcpy_dir, "adb.exe")
     with MIRROR_LOCK:
         running = MIRROR_PROCESS is not None and MIRROR_PROCESS.poll() is None
         return {
@@ -568,6 +591,9 @@ def mirror_status_snapshot() -> dict[str, Any]:
             "pid": MIRROR_PROCESS.pid if running and MIRROR_PROCESS is not None else None,
             "script_path": script_path or "built-in scrcpy launcher",
             "scrcpy_dir": scrcpy_dir,
+            "scrcpy_dir_exists": os.path.isdir(scrcpy_dir),
+            "scrcpy_exe_exists": os.path.exists(scrcpy_exe),
+            "adb_exe_exists": os.path.exists(adb_exe),
             "supported": platform.system().lower() == "windows",
         }
 
@@ -608,6 +634,18 @@ def start_mirror_script(_: str = "") -> dict[str, Any]:
             "start-mirror-script",
             False,
             "mirror script launch is only supported on Windows for this batch script",
+        )
+    if not os.path.exists(os.path.join(scrcpy_dir, "scrcpy.exe")):
+        return record_action(
+            "start-mirror-script",
+            False,
+            f"scrcpy.exe not found under {scrcpy_dir}; configure the scrcpy-win64 folder first",
+        )
+    if not os.path.exists(os.path.join(scrcpy_dir, "adb.exe")):
+        return record_action(
+            "start-mirror-script",
+            False,
+            f"adb.exe not found under {scrcpy_dir}; configure the scrcpy-win64 folder first",
         )
     with MIRROR_LOCK:
         if MIRROR_PROCESS is not None and MIRROR_PROCESS.poll() is None:
@@ -2459,6 +2497,30 @@ INDEX_HTML = """<!doctype html>
       refreshLater(6500);
     }
 
+    async function configureMirrorPath(startAfterSave = false) {
+      const current = window.latestState && window.latestState.mirror_status
+        ? window.latestState.mirror_status.scrcpy_dir
+        : "";
+      const value = window.prompt("Enter the scrcpy-win64 folder path on this Windows PC:", current || "C:\\\\Users\\\\digitaltwin\\\\Desktop\\\\scrcpy-win64-v3.3.4");
+      if (!value) {
+        return;
+      }
+      const response = await fetch("/api/mirror-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scrcpy_dir: value })
+      });
+      const result = await response.json();
+      await refresh();
+      if (!result.ok) {
+        alert(result.message || "Failed to save mirror path");
+        return;
+      }
+      if (startAfterSave) {
+        await doAction("start-mirror-script");
+      }
+    }
+
     function markButtonBusy(action, serial) {
       const selector = `button[data-action="${action}"][data-serial="${serial}"]`;
       document.querySelectorAll(selector).forEach((button) => {
@@ -2573,17 +2635,23 @@ INDEX_HTML = """<!doctype html>
     async function refresh() {
       const response = await fetch("/api/state");
       const state = await response.json();
+      window.latestState = state;
       updatedEl.textContent = `Updated ${state.timestamp} · ${state.platform} · USB backend ${state.usb_backend} · Hub backend ${state.hub_backend} · ADB ${state.adb_available ? "available" : "not installed"}`;
       const mapButton = state.hub_backend === "acroname"
         ? `<button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Refresh Acroname port map</button>`
         : "";
       const mirrorButton = state.mirror_status.running
         ? `<button class="primary" data-action="start-mirror-script" data-serial="" disabled>Mirror script running</button>`
-        : state.mirror_status.supported
+        : state.mirror_status.supported && state.mirror_status.scrcpy_exe_exists && state.mirror_status.adb_exe_exists
         ? `<button class="primary" data-action="start-mirror-script" data-serial="" onclick="doAction('start-mirror-script')">Start mirror script</button>`
+        : state.mirror_status.supported
+        ? `<button class="primary" type="button" onclick="configureMirrorPath(false)">Configure mirror path</button>`
         : `<button data-action="start-mirror-script" data-serial="" disabled>Mirror script Windows only</button>`;
+      const mirrorConfigButton = state.mirror_status.supported
+        ? `<button type="button" onclick="configureMirrorPath(false)">Change mirror path</button>`
+        : "";
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror launcher: ${state.mirror_status.script_path}. scrcpy dir: ${state.mirror_status.scrcpy_dir}.<div class="actions">${mapButton}${mirrorButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror launcher: ${state.mirror_status.script_path}. scrcpy dir: ${state.mirror_status.scrcpy_dir}.<div class="actions">${mapButton}${mirrorButton}${mirrorConfigButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")
@@ -2647,6 +2715,17 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/mirror-config":
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            result = remember_mirror_scrcpy_dir(str(payload.get("scrcpy_dir") or ""))
+            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path != "/api/action":
             self.send_error(404)
             return

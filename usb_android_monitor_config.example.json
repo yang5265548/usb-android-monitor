@@ -9,6 +9,9 @@
     "hub_serial": "0xC194E2FB",
     "ports": [1, 2, 3, 4, 5]
   },
+  "mirror": {
+    "script_path": "C:\\Users\\digitaltwin\\Desktop\\scrcpy_device_launch.bat"
+  },
   "devices": {
     "R58N123456": {
       "name": "Pixel 6 rack slot 1",

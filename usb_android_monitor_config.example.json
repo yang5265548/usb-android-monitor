@@ -12,7 +12,8 @@
   "mirror": {
     "scrcpy_dir": "C:\\Users\\digitaltwin\\Desktop\\scrcpy-win64-v3.3.4",
     "scrcpy_args": ["--no-audio", "--max-size", "1280", "--max-fps", "30", "--video-bit-rate", "4M"],
-    "check_interval_seconds": 5
+    "check_interval_seconds": 5,
+    "launch_interval_seconds": 3
   },
   "devices": {
     "R58N123456": {

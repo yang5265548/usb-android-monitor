@@ -93,6 +93,7 @@ MIRROR_TARGET_SERIALS: set[str] = set()
 MIRROR_DISABLED_SERIALS: set[str] = set()
 MIRROR_FAILED_SERIALS: dict[str, str] = {}
 MIRROR_ACTIVITY_UNTIL: dict[str, float] = {}
+MIRROR_NEXT_LAUNCH_AT = 0.0
 MIRROR_LOG_FILE = ""
 MIRROR_LOCK = threading.Lock()
 
@@ -719,8 +720,11 @@ def mirror_monitor_loop(
     scrcpy_command: list[str],
     scrcpy_args: list[str],
     interval_seconds: float,
+    launch_interval_seconds: float,
     session_dir: str,
 ) -> None:
+    global MIRROR_NEXT_LAUNCH_AT
+
     try:
         run_command([*adb_command, "start-server"], timeout=10)
         mirror_log("scrcpy monitor started")
@@ -751,13 +755,24 @@ def mirror_monitor_loop(
             with MIRROR_LOCK:
                 running_after_cleanup = set(MIRROR_SCRCPY_PROCESSES)
                 disabled = set(MIRROR_DISABLED_SERIALS)
+                next_launch_at = MIRROR_NEXT_LAUNCH_AT
             wanted_serials = serials - disabled if auto_all else serials & targets
-            for serial in sorted(wanted_serials - running_after_cleanup):
+            pending_launches = sorted(wanted_serials - running_after_cleanup)
+            now = time.time()
+            if pending_launches and now >= next_launch_at:
+                serial = pending_launches[0]
                 new_process = start_scrcpy_for_serial(serial, scrcpy_command, scrcpy_args, session_dir)
-                if new_process is not None:
-                    with MIRROR_LOCK:
+                with MIRROR_LOCK:
+                    MIRROR_NEXT_LAUNCH_AT = time.time() + launch_interval_seconds
+                    if new_process is not None:
                         MIRROR_SCRCPY_PROCESSES[serial] = new_process
-            MIRROR_STOP_EVENT.wait(interval_seconds)
+                if len(pending_launches) > 1:
+                    mirror_log(
+                        f"scrcpy launch queue delayed; launched={serial}, "
+                        f"pending={pending_launches[1:]}, interval={launch_interval_seconds}s"
+                    )
+            wait_seconds = min(max(interval_seconds, 0.5), 1.0) if pending_launches else interval_seconds
+            MIRROR_STOP_EVENT.wait(wait_seconds)
     finally:
         with MIRROR_LOCK:
             processes = dict(MIRROR_SCRCPY_PROCESSES)
@@ -778,11 +793,17 @@ def ensure_mirror_monitor_started(config: dict[str, Any]) -> tuple[bool, str]:
 
     mirror_config = config.get("mirror", {})
     interval_seconds = 5.0
+    launch_interval_seconds = 3.0
     if isinstance(mirror_config, dict):
         try:
             interval_seconds = float(mirror_config.get("check_interval_seconds", interval_seconds))
         except (TypeError, ValueError):
             interval_seconds = 5.0
+        try:
+            launch_interval_seconds = float(mirror_config.get("launch_interval_seconds", launch_interval_seconds))
+        except (TypeError, ValueError):
+            launch_interval_seconds = 3.0
+    launch_interval_seconds = max(0.5, launch_interval_seconds)
     scrcpy_dir = configured_scrcpy_dir(config)
     scrcpy_args = configured_scrcpy_args(config)
     adb_command = mirror_adb_command(scrcpy_dir)
@@ -802,7 +823,7 @@ def ensure_mirror_monitor_started(config: dict[str, Any]) -> tuple[bool, str]:
         MIRROR_STOP_EVENT.clear()
         MIRROR_MONITOR_THREAD = threading.Thread(
             target=mirror_monitor_loop,
-            args=(adb_command, scrcpy_command, scrcpy_args, interval_seconds, session_dir),
+            args=(adb_command, scrcpy_command, scrcpy_args, interval_seconds, launch_interval_seconds, session_dir),
             daemon=True,
         )
         MIRROR_MONITOR_THREAD.start()

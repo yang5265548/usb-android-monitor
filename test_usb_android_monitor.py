@@ -954,6 +954,37 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertIsNotNone(process)
         self.assertEqual(popen.call_args.args[0], ["scrcpy", "-s", "SERIAL1", "--no-audio"])
 
+    def test_mirror_monitor_staggers_pending_launches(self) -> None:
+        class FakeProcess:
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                return None
+
+        launched: list[str] = []
+
+        def fake_start(serial: str, *_args: object) -> FakeProcess:
+            launched.append(serial)
+            return FakeProcess()
+
+        def stop_after_first_wait(_seconds: float) -> bool:
+            usb_android_monitor.MIRROR_STOP_EVENT.set()
+            return True
+
+        with (
+            TemporaryDirectory() as temp_dir,
+            patch("usb_android_monitor.run_command"),
+            patch("usb_android_monitor.mirror_ready_serials", return_value=["SERIAL1", "SERIAL2", "SERIAL3"]),
+            patch("usb_android_monitor.start_scrcpy_for_serial", side_effect=fake_start),
+            patch.object(usb_android_monitor.MIRROR_STOP_EVENT, "wait", side_effect=stop_after_first_wait),
+        ):
+            with usb_android_monitor.MIRROR_LOCK:
+                usb_android_monitor.MIRROR_AUTO_ALL = True
+            usb_android_monitor.mirror_monitor_loop(["adb"], ["scrcpy"], ["--no-audio"], 5, 3, temp_dir)
+
+        self.assertEqual(launched, ["SERIAL1"])
+
     def test_scrcpy_exit_pauses_auto_restart_for_device(self) -> None:
         class ExitedProcess:
             def poll(self) -> int:

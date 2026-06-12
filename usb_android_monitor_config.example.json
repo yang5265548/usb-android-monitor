@@ -10,7 +10,8 @@
     "ports": [1, 2, 3, 4, 5]
   },
   "mirror": {
-    "scrcpy_dir": "C:\\Users\\digitaltwin\\Desktop\\scrcpy-win64-v3.3.4"
+    "scrcpy_dir": "C:\\Users\\digitaltwin\\Desktop\\scrcpy-win64-v3.3.4",
+    "check_interval_seconds": 5
   },
   "devices": {
     "R58N123456": {

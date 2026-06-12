@@ -81,63 +81,11 @@ HUB_BACKEND = os.environ.get("USB_ANDROID_MONITOR_HUB_BACKEND", "auto").strip().
 MIRROR_SCRIPT_PATH = os.environ.get("USB_ANDROID_MONITOR_MIRROR_SCRIPT", "")
 MIRROR_SCRCPY_DIR = os.environ.get("USB_ANDROID_MONITOR_SCRCPY_DIR", r"C:\Users\digitaltwin\Desktop\scrcpy-win64-v3.3.4")
 MIRROR_RUNTIME_DIR = os.environ.get("USB_ANDROID_MONITOR_MIRROR_RUNTIME_DIR", "mirror_runtime")
-MIRROR_PROCESS: subprocess.Popen[str] | None = None
+MIRROR_MONITOR_THREAD: threading.Thread | None = None
+MIRROR_STOP_EVENT = threading.Event()
+MIRROR_SCRCPY_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+MIRROR_LOG_FILE = ""
 MIRROR_LOCK = threading.Lock()
-MIRROR_SCRIPT_TEMPLATE = r"""@echo off
-setlocal enabledelayedexpansion
-
-cd /d "%~dp0"
-
-set exePath=__SCRCPY_DIR__
-
-set timestamp=session_%date:~-4%-%date:~6,2%-%date:~3,2%_%time:~0,2%-%time:~3,2%
-set timestamp=%timestamp: =0%
-
-set base=logs_android\%date:~-4%\%date:~6,2%\%date:~3,2%\%timestamp%
-
-mkdir "%base%\logcat_logs"
-mkdir "%base%\scrcpy_logs"
-mkdir "%base%\adb_logs"
-mkdir "%base%\meta"
-
-"%exePath%\adb.exe" devices -l > "%base%\meta\devices_found.txt"
-"%exePath%\adb.exe" start-server
-
-set i=0
-
-for /f "skip=1 tokens=1,2" %%A in ('"%exePath%\adb.exe" devices') do (
-    if "%%B"=="device" (
-        set /a i+=1
-        set device[!i!]=%%A
-    )
-)
-
-echo Found !i! devices
-
-for /l %%N in (1,1,!i!) do (
-    set device=!device[%%N]!
-
-    echo Starting device !device!
-
-    start /b cmd /c ""%exePath%\adb.exe" -s !device! logcat -v time > "%base%\logcat_logs\device_%%N.txt" 2>&1"
-    start /b cmd /c ""%exePath%\scrcpy.exe" -s !device! --verbosity=debug --window-title="Device %%N" > "%base%\scrcpy_logs\device_%%N.txt" 2>&1"
-
-    timeout /t 4 /nobreak > nul
-)
-
-set logfile=%base%\adb_logs\adb_state.txt
-
-:loop
-
-echo ======================================== >> "%logfile%"
-echo %date% %time% >> "%logfile%"
-
-"%exePath%\adb.exe" devices -l >> "%logfile%"
-
-timeout /t 1 /nobreak > nul
-
-goto loop
-"""
 
 
 @dataclass(frozen=True)
@@ -573,113 +521,192 @@ def remember_mirror_scrcpy_dir(scrcpy_dir: str) -> dict[str, Any]:
 
 def mirror_process_running() -> bool:
     with MIRROR_LOCK:
-        return MIRROR_PROCESS is not None and MIRROR_PROCESS.poll() is None
+        return MIRROR_MONITOR_THREAD is not None and MIRROR_MONITOR_THREAD.is_alive()
 
 
 def mirror_status_snapshot() -> dict[str, Any]:
     config = load_config()
-    script_path = configured_mirror_script_path(config)
     scrcpy_dir = configured_scrcpy_dir(config)
-    scrcpy_exe = os.path.join(scrcpy_dir, "scrcpy.exe")
-    adb_exe = os.path.join(scrcpy_dir, "adb.exe")
+    adb_command = mirror_adb_command(scrcpy_dir)
+    scrcpy_command = mirror_scrcpy_command(scrcpy_dir)
     with MIRROR_LOCK:
-        running = MIRROR_PROCESS is not None and MIRROR_PROCESS.poll() is None
+        running = MIRROR_MONITOR_THREAD is not None and MIRROR_MONITOR_THREAD.is_alive()
         return {
             "configured": True,
-            "built_in": not bool(script_path),
+            "built_in": True,
             "running": running,
-            "pid": MIRROR_PROCESS.pid if running and MIRROR_PROCESS is not None else None,
-            "script_path": script_path or "built-in scrcpy launcher",
+            "pid": None,
+            "script_path": "built-in Python scrcpy monitor",
             "scrcpy_dir": scrcpy_dir,
             "scrcpy_dir_exists": os.path.isdir(scrcpy_dir),
-            "scrcpy_exe_exists": os.path.exists(scrcpy_exe),
-            "adb_exe_exists": os.path.exists(adb_exe),
-            "supported": platform.system().lower() == "windows",
+            "scrcpy_exe_exists": bool(scrcpy_command),
+            "adb_exe_exists": bool(adb_command),
+            "supported": bool(adb_command and scrcpy_command),
+            "active_devices": sorted(MIRROR_SCRCPY_PROCESSES),
+            "log_file": MIRROR_LOG_FILE,
         }
 
 
-def prepared_windows_script_path(script_path: str) -> str:
-    if script_path.lower().endswith((".bat", ".cmd")):
-        return script_path
-    if not script_path.lower().endswith(".txt"):
-        return script_path
-    os.makedirs(MIRROR_RUNTIME_DIR, exist_ok=True)
-    prepared_path = os.path.abspath(os.path.join(MIRROR_RUNTIME_DIR, "scrcpy_device_launch.bat"))
-    with open(script_path, "r", encoding="utf-8", errors="replace") as source:
-        content = source.read()
-    with open(prepared_path, "w", encoding="utf-8", newline="\r\n") as target:
-        target.write(content)
-    write_log("mirror_script_prepared", {"source_path": script_path, "prepared_path": prepared_path})
-    return prepared_path
+def mirror_adb_command(scrcpy_dir: str) -> list[str]:
+    executable = "adb.exe" if platform.system().lower() == "windows" else "adb"
+    configured = os.path.join(scrcpy_dir, executable)
+    if scrcpy_dir and os.path.exists(configured):
+        return [configured]
+    found = shutil.which(executable) or shutil.which("adb")
+    return [found] if found else []
 
 
-def generated_mirror_script_path(scrcpy_dir: str) -> str:
-    os.makedirs(MIRROR_RUNTIME_DIR, exist_ok=True)
-    prepared_path = os.path.abspath(os.path.join(MIRROR_RUNTIME_DIR, "scrcpy_device_launch.bat"))
-    content = MIRROR_SCRIPT_TEMPLATE.replace("__SCRCPY_DIR__", scrcpy_dir)
-    with open(prepared_path, "w", encoding="utf-8", newline="\r\n") as target:
-        target.write(content)
-    write_log("mirror_script_generated", {"prepared_path": prepared_path, "scrcpy_dir": scrcpy_dir})
-    return prepared_path
+def mirror_scrcpy_command(scrcpy_dir: str) -> list[str]:
+    executable = "scrcpy.exe" if platform.system().lower() == "windows" else "scrcpy"
+    configured = os.path.join(scrcpy_dir, executable)
+    if scrcpy_dir and os.path.exists(configured):
+        return [configured]
+    found = shutil.which(executable) or shutil.which("scrcpy")
+    return [found] if found else []
+
+
+def mirror_log(message: str) -> None:
+    global MIRROR_LOG_FILE
+
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    write_log("mirror_monitor", {"message": message})
+    if not MIRROR_LOG_FILE:
+        return
+    try:
+        with open(MIRROR_LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.write("\n")
+    except OSError:
+        pass
+
+
+def mirror_ready_serials(adb_command: list[str]) -> list[str]:
+    result = run_command([*adb_command, "devices"], timeout=10)
+    if result.returncode != 0:
+        mirror_log(f"adb devices failed: {result.stderr.strip() or result.stdout.strip()}")
+        return []
+    serials: list[str] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if parts[1] == "device":
+            serials.append(parts[0])
+        else:
+            mirror_log(f"ADB device found but not ready: {parts[0]} status={parts[1]}")
+    return serials
+
+
+def start_scrcpy_for_serial(serial: str, scrcpy_command: list[str], session_dir: str) -> subprocess.Popen[str] | None:
+    log_path = os.path.join(session_dir, f"scrcpy_{serial}.log")
+    try:
+        log_handle = open(log_path, "a", encoding="utf-8", errors="replace")
+        process = subprocess.Popen(
+            [*scrcpy_command, "-s", serial],
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        log_handle.close()
+    except OSError as exc:
+        mirror_log(f"Failed to start scrcpy for {serial}: {exc}")
+        return None
+    mirror_log(f"scrcpy started for {serial}, pid={process.pid}, log={log_path}")
+    return process
+
+
+def mirror_monitor_loop(adb_command: list[str], scrcpy_command: list[str], interval_seconds: float, session_dir: str) -> None:
+    try:
+        run_command([*adb_command, "start-server"], timeout=10)
+        mirror_log("scrcpy monitor started")
+        while not MIRROR_STOP_EVENT.is_set():
+            serials = set(mirror_ready_serials(adb_command))
+            with MIRROR_LOCK:
+                running = dict(MIRROR_SCRCPY_PROCESSES)
+            for serial in sorted(serials):
+                process = running.get(serial)
+                if process is None or process.poll() is not None:
+                    new_process = start_scrcpy_for_serial(serial, scrcpy_command, session_dir)
+                    if new_process is not None:
+                        with MIRROR_LOCK:
+                            MIRROR_SCRCPY_PROCESSES[serial] = new_process
+            with MIRROR_LOCK:
+                current_processes = dict(MIRROR_SCRCPY_PROCESSES)
+            for serial, process in current_processes.items():
+                return_code = process.poll()
+                if return_code is not None:
+                    mirror_log(f"scrcpy exited for {serial}, return code={return_code}")
+                    with MIRROR_LOCK:
+                        MIRROR_SCRCPY_PROCESSES.pop(serial, None)
+                    continue
+                if serial not in serials:
+                    mirror_log(f"Device disconnected from adb: {serial}; terminating scrcpy")
+                    try:
+                        process.terminate()
+                    except OSError as exc:
+                        mirror_log(f"Failed to terminate scrcpy for {serial}: {exc}")
+                    with MIRROR_LOCK:
+                        MIRROR_SCRCPY_PROCESSES.pop(serial, None)
+            MIRROR_STOP_EVENT.wait(interval_seconds)
+    finally:
+        with MIRROR_LOCK:
+            processes = dict(MIRROR_SCRCPY_PROCESSES)
+            MIRROR_SCRCPY_PROCESSES.clear()
+        for serial, process in processes.items():
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    mirror_log(f"Terminated scrcpy for {serial}")
+                except OSError:
+                    pass
+        mirror_log("scrcpy monitor stopped")
 
 
 def start_mirror_script(_: str = "") -> dict[str, Any]:
-    global MIRROR_PROCESS
+    global MIRROR_MONITOR_THREAD, MIRROR_LOG_FILE
 
     config = load_config()
-    script_path = configured_mirror_script_path(config)
+    mirror_config = config.get("mirror", {})
+    interval_seconds = 5.0
+    if isinstance(mirror_config, dict):
+        try:
+            interval_seconds = float(mirror_config.get("check_interval_seconds", interval_seconds))
+        except (TypeError, ValueError):
+            interval_seconds = 5.0
     scrcpy_dir = configured_scrcpy_dir(config)
-    if platform.system().lower() != "windows":
-        return record_action(
-            "start-mirror-script",
-            False,
-            "mirror script launch is only supported on Windows for this batch script",
-        )
-    if not os.path.exists(os.path.join(scrcpy_dir, "scrcpy.exe")):
-        return record_action(
-            "start-mirror-script",
-            False,
-            f"scrcpy.exe not found under {scrcpy_dir}; configure the scrcpy-win64 folder first",
-        )
-    if not os.path.exists(os.path.join(scrcpy_dir, "adb.exe")):
-        return record_action(
-            "start-mirror-script",
-            False,
-            f"adb.exe not found under {scrcpy_dir}; configure the scrcpy-win64 folder first",
-        )
+    adb_command = mirror_adb_command(scrcpy_dir)
+    scrcpy_command = mirror_scrcpy_command(scrcpy_dir)
+    if not adb_command:
+        return record_action("start-mirror-script", False, "adb was not found for scrcpy monitor")
+    if not scrcpy_command:
+        return record_action("start-mirror-script", False, "scrcpy was not found; install scrcpy or configure scrcpy_dir")
     with MIRROR_LOCK:
-        if MIRROR_PROCESS is not None and MIRROR_PROCESS.poll() is None:
+        if MIRROR_MONITOR_THREAD is not None and MIRROR_MONITOR_THREAD.is_alive():
             return record_action(
                 "start-mirror-script",
                 True,
-                f"mirror script is already running; pid={MIRROR_PROCESS.pid}",
+                f"scrcpy monitor is already running; devices={sorted(MIRROR_SCRCPY_PROCESSES)}",
                 status="running",
             )
-        if script_path:
-            script_path = os.path.abspath(script_path)
-            if not os.path.exists(script_path):
-                return record_action("start-mirror-script", False, f"mirror script not found: {script_path}")
-            prepared_path = prepared_windows_script_path(script_path)
-        else:
-            prepared_path = generated_mirror_script_path(scrcpy_dir)
-        log_path = os.path.abspath(os.path.join(MIRROR_RUNTIME_DIR, "mirror_launcher.log"))
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        log_handle = open(log_path, "a", encoding="utf-8", errors="replace")
-        try:
-            MIRROR_PROCESS = subprocess.Popen(
-                ["cmd.exe", "/c", prepared_path],
-                cwd=os.path.dirname(prepared_path) or None,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        except OSError as exc:
-            log_handle.close()
-            return record_action("start-mirror-script", False, f"failed to start mirror script: {exc}")
+        session_dir = os.path.abspath(
+            os.path.join(MIRROR_RUNTIME_DIR, f"session-{time.strftime('%Y%m%d-%H%M%S')}")
+        )
+        os.makedirs(session_dir, exist_ok=True)
+        MIRROR_LOG_FILE = os.path.join(session_dir, "scrcpy_monitor.log")
+        MIRROR_STOP_EVENT.clear()
+        MIRROR_MONITOR_THREAD = threading.Thread(
+            target=mirror_monitor_loop,
+            args=(adb_command, scrcpy_command, interval_seconds, session_dir),
+            daemon=True,
+        )
+        MIRROR_MONITOR_THREAD.start()
     return record_action(
         "start-mirror-script",
         True,
-        f"mirror script started; pid={MIRROR_PROCESS.pid}; launcher_log={log_path}",
+        f"scrcpy monitor started; log={MIRROR_LOG_FILE}; adb={adb_command[0]}; scrcpy={scrcpy_command[0]}",
         status="running",
     )
 
@@ -2642,16 +2669,16 @@ INDEX_HTML = """<!doctype html>
         : "";
       const mirrorButton = state.mirror_status.running
         ? `<button class="primary" data-action="start-mirror-script" data-serial="" disabled>Mirror script running</button>`
-        : state.mirror_status.supported && state.mirror_status.scrcpy_exe_exists && state.mirror_status.adb_exe_exists
-        ? `<button class="primary" data-action="start-mirror-script" data-serial="" onclick="doAction('start-mirror-script')">Start mirror script</button>`
         : state.mirror_status.supported
+        ? `<button class="primary" data-action="start-mirror-script" data-serial="" onclick="doAction('start-mirror-script')">Start mirror script</button>`
+        : state.platform === "Windows"
         ? `<button class="primary" type="button" onclick="configureMirrorPath(false)">Configure mirror path</button>`
-        : `<button data-action="start-mirror-script" data-serial="" disabled>Mirror script Windows only</button>`;
-      const mirrorConfigButton = state.mirror_status.supported
+        : `<button data-action="start-mirror-script" data-serial="" disabled>Install adb and scrcpy</button>`;
+      const mirrorConfigButton = state.platform === "Windows"
         ? `<button type="button" onclick="configureMirrorPath(false)">Change mirror path</button>`
         : "";
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror launcher: ${state.mirror_status.script_path}. scrcpy dir: ${state.mirror_status.scrcpy_dir}.<div class="actions">${mapButton}${mirrorButton}${mirrorConfigButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror launcher: ${state.mirror_status.script_path}. scrcpy: ${state.mirror_status.scrcpy_exe_exists ? "available" : "not found"}.<div class="actions">${mapButton}${mirrorButton}${mirrorConfigButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")

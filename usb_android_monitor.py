@@ -84,6 +84,9 @@ MIRROR_RUNTIME_DIR = os.environ.get("USB_ANDROID_MONITOR_MIRROR_RUNTIME_DIR", "m
 MIRROR_MONITOR_THREAD: threading.Thread | None = None
 MIRROR_STOP_EVENT = threading.Event()
 MIRROR_SCRCPY_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+MIRROR_AUTO_ALL = False
+MIRROR_TARGET_SERIALS: set[str] = set()
+MIRROR_DISABLED_SERIALS: set[str] = set()
 MIRROR_LOG_FILE = ""
 MIRROR_LOCK = threading.Lock()
 
@@ -429,6 +432,9 @@ def run_action_async(action: str, serial: str) -> dict[str, Any]:
         "disconnect": disconnect_device,
         "map-acroname": map_acroname_ports,
         "start-mirror-script": start_mirror_script,
+        "stop-mirror-script": stop_mirror_script,
+        "start-mirror-device": start_mirror_device,
+        "stop-mirror-device": stop_mirror_device,
     }
     target = action_map.get(action)
     if target is None:
@@ -543,6 +549,9 @@ def mirror_status_snapshot() -> dict[str, Any]:
             "adb_exe_exists": bool(adb_command),
             "supported": bool(adb_command and scrcpy_command),
             "active_devices": sorted(MIRROR_SCRCPY_PROCESSES),
+            "auto_all": MIRROR_AUTO_ALL,
+            "target_serials": sorted(MIRROR_TARGET_SERIALS),
+            "disabled_serials": sorted(MIRROR_DISABLED_SERIALS),
             "log_file": MIRROR_LOG_FILE,
         }
 
@@ -626,7 +635,11 @@ def mirror_monitor_loop(adb_command: list[str], scrcpy_command: list[str], inter
             serials = set(mirror_ready_serials(adb_command))
             with MIRROR_LOCK:
                 running = dict(MIRROR_SCRCPY_PROCESSES)
-            for serial in sorted(serials):
+                auto_all = MIRROR_AUTO_ALL
+                targets = set(MIRROR_TARGET_SERIALS)
+                disabled = set(MIRROR_DISABLED_SERIALS)
+            wanted_serials = serials - disabled if auto_all else serials & targets
+            for serial in sorted(wanted_serials):
                 process = running.get(serial)
                 if process is None or process.poll() is not None:
                     new_process = start_scrcpy_for_serial(serial, scrcpy_command, session_dir)
@@ -642,8 +655,9 @@ def mirror_monitor_loop(adb_command: list[str], scrcpy_command: list[str], inter
                     with MIRROR_LOCK:
                         MIRROR_SCRCPY_PROCESSES.pop(serial, None)
                     continue
-                if serial not in serials:
-                    mirror_log(f"Device disconnected from adb: {serial}; terminating scrcpy")
+                if serial not in wanted_serials:
+                    reason = "device disconnected from adb" if serial not in serials else "mirror target disabled"
+                    mirror_log(f"{reason}: {serial}; terminating scrcpy")
                     try:
                         process.terminate()
                     except OSError as exc:
@@ -665,10 +679,9 @@ def mirror_monitor_loop(adb_command: list[str], scrcpy_command: list[str], inter
         mirror_log("scrcpy monitor stopped")
 
 
-def start_mirror_script(_: str = "") -> dict[str, Any]:
+def ensure_mirror_monitor_started(config: dict[str, Any]) -> tuple[bool, str]:
     global MIRROR_MONITOR_THREAD, MIRROR_LOG_FILE
 
-    config = load_config()
     mirror_config = config.get("mirror", {})
     interval_seconds = 5.0
     if isinstance(mirror_config, dict):
@@ -680,17 +693,12 @@ def start_mirror_script(_: str = "") -> dict[str, Any]:
     adb_command = mirror_adb_command(scrcpy_dir)
     scrcpy_command = mirror_scrcpy_command(scrcpy_dir)
     if not adb_command:
-        return record_action("start-mirror-script", False, "adb was not found for scrcpy monitor")
+        return False, "adb was not found for scrcpy monitor"
     if not scrcpy_command:
-        return record_action("start-mirror-script", False, "scrcpy was not found; install scrcpy or configure scrcpy_dir")
+        return False, "scrcpy was not found; install scrcpy or configure scrcpy_dir"
     with MIRROR_LOCK:
         if MIRROR_MONITOR_THREAD is not None and MIRROR_MONITOR_THREAD.is_alive():
-            return record_action(
-                "start-mirror-script",
-                True,
-                f"scrcpy monitor is already running; devices={sorted(MIRROR_SCRCPY_PROCESSES)}",
-                status="running",
-            )
+            return True, f"scrcpy monitor already running; devices={sorted(MIRROR_SCRCPY_PROCESSES)}"
         session_dir = os.path.abspath(
             os.path.join(MIRROR_RUNTIME_DIR, f"session-{time.strftime('%Y%m%d-%H%M%S')}")
         )
@@ -703,12 +711,89 @@ def start_mirror_script(_: str = "") -> dict[str, Any]:
             daemon=True,
         )
         MIRROR_MONITOR_THREAD.start()
+    return True, f"scrcpy monitor started; log={MIRROR_LOG_FILE}; adb={adb_command[0]}; scrcpy={scrcpy_command[0]}"
+
+
+def start_mirror_script(_: str = "") -> dict[str, Any]:
+    global MIRROR_AUTO_ALL
+
+    config = load_config()
+    with MIRROR_LOCK:
+        MIRROR_AUTO_ALL = True
+        MIRROR_DISABLED_SERIALS.clear()
+    ok, message = ensure_mirror_monitor_started(config)
+    if not ok:
+        return record_action("start-mirror-script", False, message)
     return record_action(
         "start-mirror-script",
         True,
-        f"scrcpy monitor started; log={MIRROR_LOG_FILE}; adb={adb_command[0]}; scrcpy={scrcpy_command[0]}",
+        message,
         status="running",
     )
+
+
+def start_mirror_device(serial: str) -> dict[str, Any]:
+    if not serial:
+        return record_action("start-mirror-device", False, "serial is required")
+    config = load_config()
+    with MIRROR_LOCK:
+        MIRROR_TARGET_SERIALS.add(serial)
+        MIRROR_DISABLED_SERIALS.discard(serial)
+    ok, message = ensure_mirror_monitor_started(config)
+    if not ok:
+        return record_action("start-mirror-device", False, message, serial)
+    return record_action("start-mirror-device", True, message, serial, status="running")
+
+
+def terminate_mirror_process(serial: str) -> bool:
+    with MIRROR_LOCK:
+        process = MIRROR_SCRCPY_PROCESSES.pop(serial, None)
+    if process is None:
+        return False
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except OSError as exc:
+            mirror_log(f"Failed to terminate scrcpy for {serial}: {exc}")
+    mirror_log(f"scrcpy stop requested for {serial}")
+    return True
+
+
+def stop_mirror_device(serial: str) -> dict[str, Any]:
+    if not serial:
+        return record_action("stop-mirror-device", False, "serial is required")
+    with MIRROR_LOCK:
+        MIRROR_TARGET_SERIALS.discard(serial)
+        MIRROR_DISABLED_SERIALS.add(serial)
+    stopped = terminate_mirror_process(serial)
+    message = "scrcpy stopped for device" if stopped else "device mirror was not running; device disabled for auto mirror"
+    return record_action("stop-mirror-device", True, message, serial)
+
+
+def stop_mirror_script(_: str = "") -> dict[str, Any]:
+    global MIRROR_AUTO_ALL, MIRROR_MONITOR_THREAD
+
+    with MIRROR_LOCK:
+        MIRROR_AUTO_ALL = False
+        MIRROR_TARGET_SERIALS.clear()
+        MIRROR_DISABLED_SERIALS.clear()
+        processes = dict(MIRROR_SCRCPY_PROCESSES)
+        MIRROR_SCRCPY_PROCESSES.clear()
+        monitor_thread = MIRROR_MONITOR_THREAD
+    for serial, process in processes.items():
+        if process.poll() is None:
+            try:
+                process.terminate()
+                mirror_log(f"Terminated scrcpy for {serial}")
+            except OSError as exc:
+                mirror_log(f"Failed to terminate scrcpy for {serial}: {exc}")
+    MIRROR_STOP_EVENT.set()
+    if monitor_thread is not None and monitor_thread.is_alive():
+        monitor_thread.join(timeout=2)
+    with MIRROR_LOCK:
+        if MIRROR_MONITOR_THREAD is monitor_thread:
+            MIRROR_MONITOR_THREAD = None
+    return record_action("stop-mirror-script", True, "all scrcpy mirror processes stopped")
 
 
 def adb_event_signature(device: dict[str, Any]) -> tuple[str, str, str, bool]:
@@ -2562,6 +2647,7 @@ INDEX_HTML = """<!doctype html>
 
     function androidCard(device, state) {
       const active = isSerialActive(state, device.serial);
+      const mirrorRunning = state.mirror_status && state.mirror_status.active_devices && state.mirror_status.active_devices.includes(device.serial);
       const cls = active ? "running" : device.state === "unauthorized" ? "auth" : device.needs_attention ? "warn" : "ready";
       const hub = device.behind_hub ? "Behind hub" : "Hub unknown";
       const evidence = device.hub_evidence.length ? `<div class="meta">Hub evidence: ${device.hub_evidence.join("; ")}</div>` : "";
@@ -2585,6 +2671,8 @@ INDEX_HTML = """<!doctype html>
           <button data-action="recover" data-serial="${device.serial}" ${disabled} onclick="doAction('recover', '${device.serial}')">Recover</button>
           <button data-action="verify" data-serial="${device.serial}" ${disabled} onclick="doAction('verify', '${device.serial}')">Verify</button>
           <button class="danger" data-action="disconnect" data-serial="${device.serial}" ${disabled} onclick="doAction('disconnect', '${device.serial}')">Disconnect and verify</button>
+          ${state.mirror_status.supported && !mirrorRunning ? `<button data-action="start-mirror-device" data-serial="${device.serial}" onclick="doAction('start-mirror-device', '${device.serial}')">Start Mirror</button>` : ""}
+          ${mirrorRunning ? `<button class="danger" data-action="stop-mirror-device" data-serial="${device.serial}" onclick="doAction('stop-mirror-device', '${device.serial}')">Stop Mirror</button>` : ""}
         </div>
       </article>`;
     }
@@ -2668,9 +2756,9 @@ INDEX_HTML = """<!doctype html>
         ? `<button class="primary" data-action="map-acroname" data-serial="" onclick="doAction('map-acroname')">Refresh Acroname port map</button>`
         : "";
       const mirrorButton = state.mirror_status.running
-        ? `<button class="primary" data-action="start-mirror-script" data-serial="" disabled>Mirror script running</button>`
+        ? `<button class="danger" data-action="stop-mirror-script" data-serial="" onclick="doAction('stop-mirror-script')">Stop all mirrors</button>`
         : state.mirror_status.supported
-        ? `<button class="primary" data-action="start-mirror-script" data-serial="" onclick="doAction('start-mirror-script')">Start mirror script</button>`
+        ? `<button class="primary" data-action="start-mirror-script" data-serial="" onclick="doAction('start-mirror-script')">Start all mirrors</button>`
         : state.platform === "Windows"
         ? `<button class="primary" type="button" onclick="configureMirrorPath(false)">Configure mirror path</button>`
         : `<button data-action="start-mirror-script" data-serial="" disabled>Install adb and scrcpy</button>`;

@@ -11,6 +11,7 @@
   },
   "mirror": {
     "scrcpy_dir": "C:\\Users\\digitaltwin\\Desktop\\scrcpy-win64-v3.3.4",
+    "scrcpy_args": ["--no-audio"],
     "check_interval_seconds": 5
   },
   "devices": {

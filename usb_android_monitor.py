@@ -8,6 +8,7 @@ import datetime as dt
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -512,6 +513,20 @@ def configured_scrcpy_dir(config: dict[str, Any]) -> str:
     return MIRROR_SCRCPY_DIR
 
 
+def configured_scrcpy_args(config: dict[str, Any]) -> list[str]:
+    mirror_config = config.get("mirror", {})
+    raw_args: Any = ["--no-audio"]
+    if isinstance(mirror_config, dict) and "scrcpy_args" in mirror_config:
+        raw_args = mirror_config.get("scrcpy_args")
+    if raw_args is None:
+        return []
+    if isinstance(raw_args, str):
+        return shlex.split(raw_args)
+    if isinstance(raw_args, list):
+        return [str(arg) for arg in raw_args if str(arg)]
+    return ["--no-audio"]
+
+
 def remember_mirror_scrcpy_dir(scrcpy_dir: str) -> dict[str, Any]:
     scrcpy_dir = scrcpy_dir.strip().strip('"')
     if not scrcpy_dir:
@@ -537,6 +552,7 @@ def mirror_process_running() -> bool:
 def mirror_status_snapshot() -> dict[str, Any]:
     config = load_config()
     scrcpy_dir = configured_scrcpy_dir(config)
+    scrcpy_args = configured_scrcpy_args(config)
     adb_command = mirror_adb_command(scrcpy_dir)
     scrcpy_command = mirror_scrcpy_command(scrcpy_dir)
     with MIRROR_LOCK:
@@ -548,6 +564,7 @@ def mirror_status_snapshot() -> dict[str, Any]:
             "pid": None,
             "script_path": "built-in Python scrcpy monitor",
             "scrcpy_dir": scrcpy_dir,
+            "scrcpy_args": scrcpy_args,
             "scrcpy_dir_exists": os.path.isdir(scrcpy_dir),
             "scrcpy_exe_exists": bool(scrcpy_command),
             "adb_exe_exists": bool(adb_command),
@@ -625,12 +642,18 @@ def mirror_ready_serials(adb_command: list[str]) -> list[str]:
     return serials
 
 
-def start_scrcpy_for_serial(serial: str, scrcpy_command: list[str], session_dir: str) -> subprocess.Popen[str] | None:
+def start_scrcpy_for_serial(
+    serial: str,
+    scrcpy_command: list[str],
+    scrcpy_args: list[str],
+    session_dir: str,
+) -> subprocess.Popen[str] | None:
     log_path = os.path.join(session_dir, f"scrcpy_{serial}.log")
+    command = [*scrcpy_command, "-s", serial, *scrcpy_args]
     try:
         log_handle = open(log_path, "a", encoding="utf-8", errors="replace")
         process = subprocess.Popen(
-            [*scrcpy_command, "-s", serial],
+            command,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
@@ -641,7 +664,7 @@ def start_scrcpy_for_serial(serial: str, scrcpy_command: list[str], session_dir:
         return None
     with MIRROR_LOCK:
         MIRROR_SCRCPY_LOG_FILES[serial] = log_path
-    mirror_log(f"scrcpy started for {serial}, pid={process.pid}, log={log_path}")
+    mirror_log(f"scrcpy started for {serial}, pid={process.pid}, command={shlex.join(command)}, log={log_path}")
     return process
 
 
@@ -670,7 +693,13 @@ def handle_scrcpy_exit(serial: str, process: subprocess.Popen[str], serials: set
         )
 
 
-def mirror_monitor_loop(adb_command: list[str], scrcpy_command: list[str], interval_seconds: float, session_dir: str) -> None:
+def mirror_monitor_loop(
+    adb_command: list[str],
+    scrcpy_command: list[str],
+    scrcpy_args: list[str],
+    interval_seconds: float,
+    session_dir: str,
+) -> None:
     try:
         run_command([*adb_command, "start-server"], timeout=10)
         mirror_log("scrcpy monitor started")
@@ -703,7 +732,7 @@ def mirror_monitor_loop(adb_command: list[str], scrcpy_command: list[str], inter
                 disabled = set(MIRROR_DISABLED_SERIALS)
             wanted_serials = serials - disabled if auto_all else serials & targets
             for serial in sorted(wanted_serials - running_after_cleanup):
-                new_process = start_scrcpy_for_serial(serial, scrcpy_command, session_dir)
+                new_process = start_scrcpy_for_serial(serial, scrcpy_command, scrcpy_args, session_dir)
                 if new_process is not None:
                     with MIRROR_LOCK:
                         MIRROR_SCRCPY_PROCESSES[serial] = new_process
@@ -734,6 +763,7 @@ def ensure_mirror_monitor_started(config: dict[str, Any]) -> tuple[bool, str]:
         except (TypeError, ValueError):
             interval_seconds = 5.0
     scrcpy_dir = configured_scrcpy_dir(config)
+    scrcpy_args = configured_scrcpy_args(config)
     adb_command = mirror_adb_command(scrcpy_dir)
     scrcpy_command = mirror_scrcpy_command(scrcpy_dir)
     if not adb_command:
@@ -751,11 +781,14 @@ def ensure_mirror_monitor_started(config: dict[str, Any]) -> tuple[bool, str]:
         MIRROR_STOP_EVENT.clear()
         MIRROR_MONITOR_THREAD = threading.Thread(
             target=mirror_monitor_loop,
-            args=(adb_command, scrcpy_command, interval_seconds, session_dir),
+            args=(adb_command, scrcpy_command, scrcpy_args, interval_seconds, session_dir),
             daemon=True,
         )
         MIRROR_MONITOR_THREAD.start()
-    return True, f"scrcpy monitor started; log={MIRROR_LOG_FILE}; adb={adb_command[0]}; scrcpy={scrcpy_command[0]}"
+    return True, (
+        f"scrcpy monitor started; log={MIRROR_LOG_FILE}; adb={adb_command[0]}; "
+        f"scrcpy={scrcpy_command[0]}; args={shlex.join(scrcpy_args) if scrcpy_args else '-'}"
+    )
 
 
 def start_mirror_script(_: str = "") -> dict[str, Any]:
@@ -2817,8 +2850,11 @@ INDEX_HTML = """<!doctype html>
       const mirrorConfigButton = state.platform === "Windows"
         ? `<button type="button" onclick="configureMirrorPath(false)">Change mirror path</button>`
         : "";
+      const mirrorArgs = state.mirror_status.scrcpy_args && state.mirror_status.scrcpy_args.length
+        ? state.mirror_status.scrcpy_args.join(" ")
+        : "-";
       noticeEl.innerHTML = state.adb_available
-        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror launcher: ${state.mirror_status.script_path}. scrcpy: ${state.mirror_status.scrcpy_exe_exists ? "available" : "not found"}.<div class="actions">${mapButton}${mirrorButton}${mirrorConfigButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
+        ? `Auto recovery is ${state.auto_reconnect_enabled ? "enabled" : "disabled"}. Hub backend: ${state.hub_backend}. Config file: ${state.config_path}. Run log: ${state.latest_log_path}. Mirror launcher: ${state.mirror_status.script_path}. scrcpy: ${state.mirror_status.scrcpy_exe_exists ? "available" : "not found"}. Mirror args: ${mirrorArgs}.<div class="actions">${mapButton}${mirrorButton}${mirrorConfigButton}<button data-action="reconnect" data-serial="" onclick="doAction('reconnect')">Restart ADB discovery</button></div>`
         : `Install Android platform-tools and make sure adb is on PATH before using reconnect controls.`;
       diagnosticsEl.innerHTML = state.diagnostics.length
         ? state.diagnostics.map(diagnosticCard).join("")

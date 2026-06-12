@@ -837,6 +837,33 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(result["message"], "started")
         self.assertEqual(usb_android_monitor.active_actions_snapshot(), [])
 
+    def test_scrcpy_args_default_to_no_audio(self) -> None:
+        self.assertEqual(usb_android_monitor.configured_scrcpy_args({}), ["--no-audio"])
+        self.assertEqual(
+            usb_android_monitor.configured_scrcpy_args({"mirror": {"scrcpy_args": "--no-audio --max-fps 30"}}),
+            ["--no-audio", "--max-fps", "30"],
+        )
+        self.assertEqual(usb_android_monitor.configured_scrcpy_args({"mirror": {"scrcpy_args": []}}), [])
+
+    def test_start_scrcpy_uses_configured_args(self) -> None:
+        class FakeProcess:
+            pid = 123
+
+            def poll(self) -> None:
+                return None
+
+        with TemporaryDirectory() as temp_dir:
+            with patch("usb_android_monitor.subprocess.Popen", return_value=FakeProcess()) as popen:
+                process = usb_android_monitor.start_scrcpy_for_serial(
+                    "SERIAL1",
+                    ["scrcpy"],
+                    ["--no-audio"],
+                    temp_dir,
+                )
+
+        self.assertIsNotNone(process)
+        self.assertEqual(popen.call_args.args[0], ["scrcpy", "-s", "SERIAL1", "--no-audio"])
+
     def test_scrcpy_exit_pauses_auto_restart_for_device(self) -> None:
         class ExitedProcess:
             def poll(self) -> int:

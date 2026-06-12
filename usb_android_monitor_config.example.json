@@ -10,7 +10,7 @@
     "ports": [1, 2, 3, 4, 5]
   },
   "mirror": {
-    "script_path": "C:\\Users\\digitaltwin\\Desktop\\scrcpy_device_launch.bat"
+    "scrcpy_dir": "C:\\Users\\digitaltwin\\Desktop\\scrcpy-win64-v3.3.4"
   },
   "devices": {
     "R58N123456": {

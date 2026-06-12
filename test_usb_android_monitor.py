@@ -41,6 +41,14 @@ class UsbAndroidMonitorTest(unittest.TestCase):
             usb_android_monitor.EVENT_HISTORY.clear()
             usb_android_monitor.MANUAL_DISCONNECT_UNTIL.clear()
             usb_android_monitor.HUB_BACKEND = "acroname"
+        with usb_android_monitor.MIRROR_LOCK:
+            usb_android_monitor.MIRROR_SCRCPY_PROCESSES.clear()
+            usb_android_monitor.MIRROR_SCRCPY_LOG_FILES.clear()
+            usb_android_monitor.MIRROR_AUTO_ALL = False
+            usb_android_monitor.MIRROR_TARGET_SERIALS.clear()
+            usb_android_monitor.MIRROR_DISABLED_SERIALS.clear()
+            usb_android_monitor.MIRROR_FAILED_SERIALS.clear()
+            usb_android_monitor.MIRROR_LOG_FILE = ""
         usb_android_monitor.LOG_ENABLED = False
 
     def tearDown(self) -> None:
@@ -820,6 +828,41 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         actions = last_actions_snapshot()
         self.assertEqual(actions[0]["action"], "device-connected")
         self.assertEqual(actions[0]["serial"], "SERIAL1")
+
+    def test_mirror_actions_complete_without_active_queue_entry(self) -> None:
+        with patch("usb_android_monitor.start_mirror_script", return_value={"ok": True, "message": "started"}) as start:
+            result = usb_android_monitor.run_action_async("start-mirror-script", "")
+
+        start.assert_called_once_with("")
+        self.assertEqual(result["message"], "started")
+        self.assertEqual(usb_android_monitor.active_actions_snapshot(), [])
+
+    def test_scrcpy_exit_pauses_auto_restart_for_device(self) -> None:
+        class ExitedProcess:
+            def poll(self) -> int:
+                return 1
+
+        with TemporaryDirectory() as temp_dir:
+            log_path = os.path.join(temp_dir, "scrcpy_SERIAL1.log")
+            with open(log_path, "w", encoding="utf-8") as handle:
+                handle.write("ERROR: device disconnected\n")
+            with usb_android_monitor.MIRROR_LOCK:
+                usb_android_monitor.MIRROR_SCRCPY_PROCESSES["SERIAL1"] = ExitedProcess()  # type: ignore[assignment]
+                usb_android_monitor.MIRROR_SCRCPY_LOG_FILES["SERIAL1"] = log_path
+                usb_android_monitor.MIRROR_AUTO_ALL = True
+
+            usb_android_monitor.handle_scrcpy_exit(
+                "SERIAL1",
+                ExitedProcess(),  # type: ignore[arg-type]
+                {"SERIAL1"},
+                {"SERIAL1"},
+            )
+
+        with usb_android_monitor.MIRROR_LOCK:
+            self.assertIn("SERIAL1", usb_android_monitor.MIRROR_DISABLED_SERIALS)
+            self.assertIn("SERIAL1", usb_android_monitor.MIRROR_FAILED_SERIALS)
+            self.assertNotIn("SERIAL1", usb_android_monitor.MIRROR_SCRCPY_PROCESSES)
+        self.assertEqual(last_actions_snapshot()[0]["action"], "scrcpy mirror exited")
 
 
 if __name__ == "__main__":

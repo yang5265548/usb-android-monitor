@@ -71,6 +71,7 @@ CONFIG_PATH = os.environ.get("USB_ANDROID_MONITOR_CONFIG", "usb_android_monitor_
 STATE_PATH = os.environ.get("USB_ANDROID_MONITOR_STATE", "usb_android_monitor_state.json")
 LOG_DIR = os.environ.get("USB_ANDROID_MONITOR_LOG_DIR", "logs")
 LOG_ENABLED = os.environ.get("USB_ANDROID_MONITOR_LOG_ENABLED", "1") != "0"
+LOG_STATE_SAVES = os.environ.get("USB_ANDROID_MONITOR_LOG_STATE_SAVES", "0") == "1"
 LOG_LOCK = threading.Lock()
 EVENT_HISTORY: list[dict[str, Any]] = []
 LAST_ADB_RAW_OUTPUT = ""
@@ -1113,13 +1114,16 @@ def save_state(state: dict[str, Any], path: str = STATE_PATH) -> None:
         json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
     os.replace(tmp_path, path)
-    write_log(
-        "state_saved",
-        {
-            "state_path": path,
-            "known_device_count": len(state.get("known_devices", {})) if isinstance(state.get("known_devices"), dict) else 0,
-        },
-    )
+    if LOG_STATE_SAVES:
+        write_log(
+            "state_saved",
+            {
+                "state_path": path,
+                "known_device_count": (
+                    len(state.get("known_devices", {})) if isinstance(state.get("known_devices"), dict) else 0
+                ),
+            },
+        )
 
 
 def remember_known_device(serial: str, data: dict[str, Any]) -> None:

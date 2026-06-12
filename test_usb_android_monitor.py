@@ -354,6 +354,44 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(state["known_devices"]["AUTO"]["power_state"], "on")
         self.assertEqual(state["known_devices"]["CONFIG"]["acroname_control"]["port"], 2)
 
+    def test_save_state_does_not_log_by_default(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            old_dir = usb_android_monitor.LOG_DIR
+            old_latest_initialized = usb_android_monitor.LATEST_LOGS_INITIALIZED
+            old_log_state_saves = usb_android_monitor.LOG_STATE_SAVES
+            usb_android_monitor.LOG_DIR = os.path.join(temp_dir, "logs")
+            usb_android_monitor.LATEST_LOGS_INITIALIZED = False
+            usb_android_monitor.LOG_ENABLED = True
+            usb_android_monitor.LOG_STATE_SAVES = False
+            try:
+                usb_android_monitor.save_state({"known_devices": {}}, os.path.join(temp_dir, "state.json"))
+                entries = recent_persistent_logs(20)
+            finally:
+                usb_android_monitor.LOG_DIR = old_dir
+                usb_android_monitor.LATEST_LOGS_INITIALIZED = old_latest_initialized
+                usb_android_monitor.LOG_STATE_SAVES = old_log_state_saves
+
+        self.assertFalse(any(entry["event"] == "state_saved" for entry in entries))
+
+    def test_save_state_log_can_be_enabled_for_debugging(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            old_dir = usb_android_monitor.LOG_DIR
+            old_latest_initialized = usb_android_monitor.LATEST_LOGS_INITIALIZED
+            old_log_state_saves = usb_android_monitor.LOG_STATE_SAVES
+            usb_android_monitor.LOG_DIR = os.path.join(temp_dir, "logs")
+            usb_android_monitor.LATEST_LOGS_INITIALIZED = False
+            usb_android_monitor.LOG_ENABLED = True
+            usb_android_monitor.LOG_STATE_SAVES = True
+            try:
+                usb_android_monitor.save_state({"known_devices": {}}, os.path.join(temp_dir, "state.json"))
+                entries = recent_persistent_logs(20)
+            finally:
+                usb_android_monitor.LOG_DIR = old_dir
+                usb_android_monitor.LATEST_LOGS_INITIALIZED = old_latest_initialized
+                usb_android_monitor.LOG_STATE_SAVES = old_log_state_saves
+
+        self.assertTrue(any(entry["event"] == "state_saved" for entry in entries))
+
     def test_normalized_acroname_ports_scans_zero_last(self) -> None:
         self.assertEqual(normalized_acroname_ports([0, 3, 1, 0]), [1, 3, 0])
 

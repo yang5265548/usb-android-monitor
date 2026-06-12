@@ -92,6 +92,7 @@ MIRROR_AUTO_ALL = False
 MIRROR_TARGET_SERIALS: set[str] = set()
 MIRROR_DISABLED_SERIALS: set[str] = set()
 MIRROR_FAILED_SERIALS: dict[str, str] = {}
+MIRROR_ACTIVITY_UNTIL: dict[str, float] = {}
 MIRROR_LOG_FILE = ""
 MIRROR_LOCK = threading.Lock()
 
@@ -399,6 +400,10 @@ def diagnose_disconnect(
         reason = "hub_port_power_off"
         confidence = "high"
         evidence.append("recent hub port off action returned ok")
+    elif has_recent_mirror_activity(serial):
+        reason = "scrcpy_session_adb_loss"
+        confidence = "high"
+        evidence.append("ADB serial disappeared during or shortly after a scrcpy mirror session")
     elif len(affected_serials) > 1:
         reason = "hub_or_upstream_disconnect"
         confidence = "high"
@@ -613,7 +618,7 @@ def mirror_log(message: str) -> None:
         pass
 
 
-def read_log_tail(path: str, max_chars: int = 3000) -> str:
+def read_log_tail(path: str, max_chars: int = 4000) -> str:
     if not path:
         return ""
     try:
@@ -621,7 +626,19 @@ def read_log_tail(path: str, max_chars: int = 3000) -> str:
             text = handle.read()
     except OSError:
         return ""
-    return text[-max_chars:].strip()
+    lines = [line.strip() for line in text[-max_chars:].splitlines() if line.strip()]
+    important = [
+        line
+        for line in lines
+        if any(marker in line for marker in ("ERROR", "WARN", "Exception", "Device disconnected", "Capture/encoding"))
+    ]
+    selected = important[-8:] if important else lines[-8:]
+    return " | ".join(selected)[-1600:]
+
+
+def has_recent_mirror_activity(serial: str) -> bool:
+    with MIRROR_LOCK:
+        return time.time() < MIRROR_ACTIVITY_UNTIL.get(serial, 0)
 
 
 def mirror_ready_serials(adb_command: list[str]) -> list[str]:
@@ -666,6 +683,7 @@ def start_scrcpy_for_serial(
         return None
     with MIRROR_LOCK:
         MIRROR_SCRCPY_LOG_FILES[serial] = log_path
+        MIRROR_ACTIVITY_UNTIL[serial] = time.time() + 90
     mirror_log(f"scrcpy started for {serial}, pid={process.pid}, command={shlex.join(command)}, log={log_path}")
     return process
 
@@ -687,6 +705,7 @@ def handle_scrcpy_exit(serial: str, process: subprocess.Popen[str], serials: set
             MIRROR_DISABLED_SERIALS.add(serial)
             MIRROR_TARGET_SERIALS.discard(serial)
             MIRROR_FAILED_SERIALS[serial] = detail
+            MIRROR_ACTIVITY_UNTIL[serial] = time.time() + 180
         record_action(
             "scrcpy mirror exited",
             False,
@@ -2377,6 +2396,8 @@ def auto_reconnect_if_needed(devices: list[dict[str, Any]], config: dict[str, An
         serial = device["serial"]
         if now < MANUAL_DISCONNECT_UNTIL.get(serial, 0):
             continue
+        if has_recent_mirror_activity(serial):
+            continue
         if device["state"] not in {"offline", "unknown"}:
             continue
         if now - AUTO_RECONNECT_ATTEMPTS.get(serial, 0) < interval_seconds:
@@ -2387,6 +2408,8 @@ def auto_reconnect_if_needed(devices: list[dict[str, Any]], config: dict[str, An
     current_serials = {device["serial"] for device in devices}
     for serial in configured_devices(config):
         if now < MANUAL_DISCONNECT_UNTIL.get(serial, 0):
+            continue
+        if has_recent_mirror_activity(serial):
             continue
         if serial in current_serials:
             continue

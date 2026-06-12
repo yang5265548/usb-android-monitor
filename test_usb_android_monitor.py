@@ -48,6 +48,7 @@ class UsbAndroidMonitorTest(unittest.TestCase):
             usb_android_monitor.MIRROR_TARGET_SERIALS.clear()
             usb_android_monitor.MIRROR_DISABLED_SERIALS.clear()
             usb_android_monitor.MIRROR_FAILED_SERIALS.clear()
+            usb_android_monitor.MIRROR_ACTIVITY_UNTIL.clear()
             usb_android_monitor.MIRROR_LOG_FILE = ""
         usb_android_monitor.LOG_ENABLED = False
 
@@ -196,6 +197,31 @@ class UsbAndroidMonitorTest(unittest.TestCase):
         self.assertEqual(diagnosis["reason"], "hub_or_upstream_disconnect")
         self.assertEqual(diagnosis["confidence"], "high")
         self.assertEqual(diagnosis["affected_serials"], ["SERIAL1", "SERIAL2"])
+
+    def test_disconnect_diagnosis_flags_recent_scrcpy_activity(self) -> None:
+        with TemporaryDirectory() as log_dir:
+            old_dir = usb_android_monitor.LOG_DIR
+            old_latest_initialized = usb_android_monitor.LATEST_LOGS_INITIALIZED
+            usb_android_monitor.LOG_DIR = log_dir
+            usb_android_monitor.LATEST_LOGS_INITIALIZED = False
+            usb_android_monitor.LOG_ENABLED = True
+            with usb_android_monitor.MIRROR_LOCK:
+                usb_android_monitor.MIRROR_ACTIVITY_UNTIL["SERIAL1"] = usb_android_monitor.time.time() + 60
+            try:
+                diagnose_disconnect(
+                    "SERIAL1",
+                    ["SERIAL1"],
+                    ("device", "2-2.3", "7", True),
+                    {"backend": "test-usb-log", "ok": True, "raw": "usb disconnect"},
+                )
+                entries = recent_persistent_logs(20)
+            finally:
+                usb_android_monitor.LOG_DIR = old_dir
+                usb_android_monitor.LATEST_LOGS_INITIALIZED = old_latest_initialized
+
+        diagnosis = next(entry for entry in entries if entry["event"] == "disconnect_diagnosis")
+        self.assertEqual(diagnosis["reason"], "scrcpy_session_adb_loss")
+        self.assertEqual(diagnosis["confidence"], "high")
 
     def test_non_android_usb_device_is_not_candidate(self) -> None:
         state = {
@@ -819,6 +845,21 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
             snapshot()
 
         forget.assert_not_called()
+
+    def test_auto_reconnect_skips_recent_scrcpy_disconnect(self) -> None:
+        with usb_android_monitor.MIRROR_LOCK:
+            usb_android_monitor.MIRROR_ACTIVITY_UNTIL["SERIAL1"] = usb_android_monitor.time.time() + 60
+
+        with patch("usb_android_monitor.recover_device") as recover:
+            usb_android_monitor.auto_reconnect_if_needed(
+                [],
+                {
+                    "auto_recovery": {"enabled": True, "cooldown_seconds": 0},
+                    "devices": {"SERIAL1": {"name": "Rack phone"}},
+                },
+            )
+
+        recover.assert_not_called()
 
     def test_snapshot_does_not_return_persistent_logs_to_recent_actions(self) -> None:
         with (

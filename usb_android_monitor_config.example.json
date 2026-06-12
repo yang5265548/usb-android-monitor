@@ -11,7 +11,7 @@
   },
   "mirror": {
     "scrcpy_dir": "C:\\Users\\digitaltwin\\Desktop\\scrcpy-win64-v3.3.4",
-    "scrcpy_args": ["--no-audio"],
+    "scrcpy_args": ["--no-audio", "--max-size", "1280", "--max-fps", "30", "--video-bit-rate", "4M"],
     "check_interval_seconds": 5
   },
   "devices": {

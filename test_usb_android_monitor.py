@@ -838,7 +838,10 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(usb_android_monitor.active_actions_snapshot(), [])
 
     def test_scrcpy_args_default_to_no_audio(self) -> None:
-        self.assertEqual(usb_android_monitor.configured_scrcpy_args({}), ["--no-audio"])
+        self.assertEqual(
+            usb_android_monitor.configured_scrcpy_args({}),
+            ["--no-audio", "--max-size", "1280", "--max-fps", "30", "--video-bit-rate", "4M"],
+        )
         self.assertEqual(
             usb_android_monitor.configured_scrcpy_args({"mirror": {"scrcpy_args": "--no-audio --max-fps 30"}}),
             ["--no-audio", "--max-fps", "30"],

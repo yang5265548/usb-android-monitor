@@ -82,6 +82,7 @@ HUB_BACKEND = os.environ.get("USB_ANDROID_MONITOR_HUB_BACKEND", "auto").strip().
 MIRROR_SCRIPT_PATH = os.environ.get("USB_ANDROID_MONITOR_MIRROR_SCRIPT", "")
 MIRROR_SCRCPY_DIR = os.environ.get("USB_ANDROID_MONITOR_SCRCPY_DIR", r"C:\Users\digitaltwin\Desktop\scrcpy-win64-v3.3.4")
 MIRROR_RUNTIME_DIR = os.environ.get("USB_ANDROID_MONITOR_MIRROR_RUNTIME_DIR", "mirror_runtime")
+DEFAULT_SCRCPY_ARGS = ["--no-audio", "--max-size", "1280", "--max-fps", "30", "--video-bit-rate", "4M"]
 MIRROR_MONITOR_THREAD: threading.Thread | None = None
 MIRROR_STOP_EVENT = threading.Event()
 MIRROR_SCRCPY_PROCESSES: dict[str, subprocess.Popen[str]] = {}
@@ -515,7 +516,7 @@ def configured_scrcpy_dir(config: dict[str, Any]) -> str:
 
 def configured_scrcpy_args(config: dict[str, Any]) -> list[str]:
     mirror_config = config.get("mirror", {})
-    raw_args: Any = ["--no-audio"]
+    raw_args: Any = DEFAULT_SCRCPY_ARGS
     if isinstance(mirror_config, dict) and "scrcpy_args" in mirror_config:
         raw_args = mirror_config.get("scrcpy_args")
     if raw_args is None:
@@ -524,7 +525,7 @@ def configured_scrcpy_args(config: dict[str, Any]) -> list[str]:
         return shlex.split(raw_args)
     if isinstance(raw_args, list):
         return [str(arg) for arg in raw_args if str(arg)]
-    return ["--no-audio"]
+    return list(DEFAULT_SCRCPY_ARGS)
 
 
 def remember_mirror_scrcpy_dir(scrcpy_dir: str) -> dict[str, Any]:

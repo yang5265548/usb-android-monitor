@@ -837,6 +837,14 @@ R58N123456 device usb:1-1.2 product:oriole model:Pixel_6 device:oriole transport
         self.assertEqual(result["message"], "started")
         self.assertEqual(usb_android_monitor.active_actions_snapshot(), [])
 
+    def test_start_mirror_action_records_ok_status(self) -> None:
+        with patch("usb_android_monitor.ensure_mirror_monitor_started", return_value=(True, "started")):
+            result = usb_android_monitor.start_mirror_script("")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(last_actions_snapshot()[0]["status"], "ok")
+
     def test_scrcpy_args_default_to_no_audio(self) -> None:
         self.assertEqual(
             usb_android_monitor.configured_scrcpy_args({}),

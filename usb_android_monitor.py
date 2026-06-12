@@ -807,7 +807,6 @@ def start_mirror_script(_: str = "") -> dict[str, Any]:
         "start-mirror-script",
         True,
         message,
-        status="running",
     )
 
 
@@ -822,7 +821,7 @@ def start_mirror_device(serial: str) -> dict[str, Any]:
     ok, message = ensure_mirror_monitor_started(config)
     if not ok:
         return record_action("start-mirror-device", False, message, serial)
-    return record_action("start-mirror-device", True, message, serial, status="running")
+    return record_action("start-mirror-device", True, message, serial)
 
 
 def terminate_mirror_process(serial: str) -> bool:
